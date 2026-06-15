@@ -12,7 +12,19 @@ import postRoutes from "./routes/postRoutes.js";
 import visitorRoutes from "./routes/visitorRoutes.js";
 
 const app = express();
-app.use(cors({ origin: process.env.CLIENT_URL || "*" }));
+
+// allowed frontend origins (local dev + deployed Vercel site)
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://abhijit-art-frontend.vercel.app",
+  process.env.CLIENT_URL || "",
+].filter(Boolean);
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+}));
+
 app.use(express.json());
 app.set("trust proxy", true);
 
