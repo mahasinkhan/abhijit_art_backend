@@ -1,0 +1,45 @@
+{
+  "name": "backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "src/server.ts",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "dev": "tsx watch src/server.ts",
+    "seed": "tsx src/seed.ts",
+    "typecheck": "tsc --noEmit",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "prisma": {
+    "seed": "tsx src/seed.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.19.3",
+    "bcryptjs": "^3.0.3",
+    "cloudinary": "^1.41.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "geoip-lite": "^1.4.10",
+    "jsonwebtoken": "^9.0.3",
+    "multer": "^2.1.1",
+    "multer-storage-cloudinary": "^4.0.0",
+    "sharp": "^0.34.5",
+    "ua-parser-js": "^2.0.10"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/geoip-lite": "^1.4.4",
+    "@types/node": "^25.9.2",
+    "prisma": "^6.19.3",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.22.4",
+    "typescript": "^6.0.3"
+  }
+}
