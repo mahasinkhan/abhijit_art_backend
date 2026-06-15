@@ -88,7 +88,7 @@ router.delete("/:id", protect, async (req: Request, res: Response) => {
     if (req.user?.role !== "admin")
       return res.status(403).json({ message: "Admins only" });
 
-    const post = await prisma.post.findUnique({ where: { id: req.params.id } });
+    const post = await prisma.post.findUnique({ where: { id: String(req.params.id) } });
     if (!post) return res.status(404).json({ message: "Post not found" });
 
     await cloudinary.uploader.destroy(post.publicId, {

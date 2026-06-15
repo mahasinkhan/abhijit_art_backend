@@ -74,7 +74,7 @@ router.get("/", protect, adminOnly, async (_req: Request, res: Response) => {
 
 router.patch("/:id/status", protect, adminOnly, async (req: Request, res: Response) => {
   const booking = await prisma.booking.update({
-    where: { id: req.params.id },
+    where: { id: String(req.params.id) },
     data: { status: req.body.status },
     include: { user: userPublic },
   });
