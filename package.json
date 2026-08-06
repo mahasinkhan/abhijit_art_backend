@@ -5,6 +5,7 @@
   "main": "src/server.ts",
   "type": "module",
   "scripts": {
+    "postinstall": "prisma generate",
     "build": "tsc --noEmit",
     "start": "tsx src/server.ts",
     "dev": "tsx watch src/server.ts",
@@ -31,6 +32,8 @@
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
     "multer-storage-cloudinary": "^4.0.0",
+    "nodemailer": "^9.0.3",
+    "pdfkit": "^0.19.1",
     "sharp": "^0.34.5",
     "tsx": "^4.22.4",
     "ua-parser-js": "^2.0.10"
@@ -42,6 +45,8 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/multer": "^2.1.0",
     "@types/node": "^25.9.2",
+    "@types/nodemailer": "^8.0.1",
+    "@types/pdfkit": "^0.17.6",
     "prisma": "^6.19.3",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
