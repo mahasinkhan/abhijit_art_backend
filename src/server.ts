@@ -28,7 +28,8 @@ const app = express();
 // allowed frontend origins (local dev + deployed Vercel site)
 const allowedOrigins = [
   "http://localhost:5173",
-  "https://abhijit-art-frontend.vercel.app",
+  "https://abhijit-art-frontend-xu6u.vercel.app",
+  "https://abhijit-art-backend-ve50.onrender.com", // Add this (for any same-origin requests)
   process.env.CLIENT_URL || "",
 ].filter(Boolean);
 
