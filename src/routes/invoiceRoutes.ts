@@ -1,5 +1,8 @@
 // backend/src/routes/invoiceRoutes.ts
 import { Router, type Request, type Response } from "express";
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
 import { protect, adminOnly } from "../middleware/auth.js";
 import { transporter, mailFrom, siteUrl } from "../config/mailer.js";
 import { buildInvoicePdf, pdfHasRupeeGlyph, invoiceLogoPath } from "../utils/invoicePdf.js";
@@ -8,14 +11,12 @@ import { isPinSet, verifyPin, logAudit } from "../utils/security.js";
 
 const router = Router();
 
-/* admin-only: only staff email or store invoices */
-router.use(protect, adminOnly);
-
 const str = (v: unknown) => String(v ?? "").trim();
 const num = (v: unknown) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
 };
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 const clamp = (n: number, lo: number, hi: number) => Math.min(Math.max(n, lo), hi);
 const isEmail = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v);
 
@@ -36,6 +37,15 @@ const fmtDate = (d: string) => {
 
 type Party = { name?: string; address?: string; phone?: string; email?: string; gstin?: string; pan?: string };
 type Line = { desc?: string; qty?: unknown; rate?: unknown };
+
+/* only these two source values are accepted anywhere; anything else falls back */
+const asSource = (v: unknown, fallback: "online" | "offline"): "online" | "offline" =>
+  v === "online" ? "online" : v === "offline" ? "offline" : fallback;
+
+/* payment method — only cash | online accepted; anything else falls back.
+   online = UPI / card / bank transfer; cash = paid in hand. */
+const asMethod = (v: unknown, fallback: "cash" | "online"): "cash" | "online" =>
+  v === "cash" ? "cash" : v === "online" ? "online" : fallback;
 
 /* one source of truth for the money math, shared by the email + save routes,
    so the emailed figures, the PDF and the stored record can never disagree.
@@ -58,17 +68,200 @@ function deriveStatus(paid: number, total: number): "unpaid" | "partial" | "paid
   return "partial";
 }
 
-/* PIN gate for sensitive actions (delete / cancel / payment). Returns an error
-   to send back, or null if the PIN checks out. Reads the PIN from req.body.pin. */
+/* first word of a name, for a friendly greeting */
+const firstNameOf = (full: string) => str(full).split(/\s+/)[0] || "there";
+
+/* short personal note for a payment reminder (fallback when the client didn't
+   type one). Deliberately carries NO numbers — the email shows a styled
+   amount-due card, and WhatsApp appends the figures on the client side. */
+function defaultReminderNote(invoice: { clientName: string; business: unknown }) {
+  const biz = (invoice.business || {}) as Party;
+  const bizName = str(biz.name) || "Abhijit Art";
+  const name = firstNameOf(invoice.clientName);
+  return `Hi ${name}, this is a gentle reminder from ${bizName} about the invoice below. Whenever it's convenient, we'd appreciate it if you could clear the outstanding balance. Thank you for your business!`;
+}
+
+/* the logo for the reminder email — embedded inline via CID so it shows even
+   when the client blocks remote images. Prefer whatever the invoice PDF uses;
+   otherwise fall back to backend/assets and (in dev) the frontend public dir. */
+function resolveLogoPath(): string | null {
+  if (invoiceLogoPath) return invoiceLogoPath;
+  const candidates = [
+    process.env.EMAIL_LOGO_FILE,
+    path.resolve(process.cwd(), "assets/abhijit_art_logo.png"),
+    path.resolve(process.cwd(), "../frontend/public/images/abhijit_art_logo.png"),
+    path.resolve(process.cwd(), "public/images/abhijit_art_logo.png"),
+  ].filter(Boolean) as string[];
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) return c;
+    } catch {
+      /* ignore */
+    }
+  }
+  return null;
+}
+const reminderLogoPath = resolveLogoPath();
+
+/* the payment history, oldest-first, attached to every invoice we return */
+const withPayments = { payments: { orderBy: { createdAt: "asc" as const } } };
+
+/* THE invariant: an invoice's paidAmount is always the SUM of its payment rows
+   (clamped to the total), and its status is derived from that. Call this after
+   any change to the ledger or the total. reactivate=true clears a "cancelled"
+   flag (recording money un-cancels); otherwise a cancelled invoice stays
+   cancelled. Returns the updated invoice WITH its payments. */
+async function recomputeInvoice(invoiceId: string, opts: { reactivate?: boolean } = {}) {
+  const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, include: withPayments });
+  if (!inv) return null;
+  const total = Number(inv.total);
+  const sum = inv.payments.reduce((s, p) => s + Number(p.amount), 0);
+  const paidAmount = clamp(round2(sum), 0, total);
+  const status =
+    !opts.reactivate && inv.status === "cancelled" ? "cancelled" : deriveStatus(paidAmount, total);
+  return prisma.invoice.update({
+    where: { id: invoiceId },
+    data: { paidAmount, status: status as "unpaid" | "partial" | "paid" | "cancelled" },
+    include: withPayments,
+  });
+}
+
+/* PIN gate for sensitive actions (delete / cancel / payment / edit). Returns an
+   error to send back, or null if the PIN checks out. Reads from req.body.pin. */
 async function pinError(req: Request): Promise<{ code: number; message: string } | null> {
   if (!(await isPinSet())) {
-    return { code: 409, message: "No security PIN is set yet. Set one in Settings before deleting, cancelling or changing a payment." };
+    return { code: 409, message: "No security PIN is set yet. Set one in Settings before deleting, cancelling, editing or recording a payment." };
   }
   if (!(await verifyPin(str(req.body?.pin)))) {
     return { code: 403, message: "Incorrect security PIN." };
   }
   return null;
 }
+
+/* ── one place to turn a stored invoice record into a PDF ──────────────
+   Used by the email reminder, the invoice email re-send, and the public
+   /pdf link — so all three render identically, INCLUDING Paid / Balance due
+   (paidAmount comes from the ledger-derived field on the record). */
+type InvoiceRecord = {
+  invoiceNo: string; date: Date; business: unknown;
+  clientName: string; clientAddr: string | null; clientPhone: string | null;
+  clientEmail: string | null; clientGstin: string | null;
+  items: unknown; subtotal: unknown; discType: string; discVal: unknown;
+  discountAmt: unknown; taxPct: unknown; taxAmt: unknown; total: unknown;
+  paidAmount: unknown; notes: string | null; warranty: string | null;
+};
+async function buildInvoicePdfFromRecord(invoice: InvoiceRecord): Promise<Buffer> {
+  const biz = (invoice.business || {}) as Party;
+  const items = Array.isArray(invoice.items) ? (invoice.items as Line[]) : [];
+  return buildInvoicePdf({
+    invNo: invoice.invoiceNo,
+    date: fmtDate(invoice.date.toISOString()),
+    biz,
+    client: {
+      name: invoice.clientName,
+      address: invoice.clientAddr || "",
+      phone: invoice.clientPhone || "",
+      email: invoice.clientEmail || "",
+      gstin: invoice.clientGstin || "",
+    },
+    lines: items.map((it) => ({ desc: str(it.desc), qty: num(it.qty), rate: num(it.rate) })),
+    subtotal: Number(invoice.subtotal),
+    discountAmt: Number(invoice.discountAmt),
+    discountLabel: `Discount${invoice.discType === "percent" ? ` (${Number(invoice.discVal)}%)` : ""}`,
+    taxAmt: Number(invoice.taxAmt),
+    taxLabel: `GST (${Number(invoice.taxPct)}%)`,
+    total: Number(invoice.total),
+    paidAmount: Number(invoice.paidAmount),
+    notes: invoice.notes || "",
+    warranty: invoice.warranty || "",
+    siteUrl: siteUrl(),
+  });
+}
+
+/* ── public invoice PDF: signed, unguessable links ─────────────────────
+   A wa.me reminder can't attach a file, so we attach a LINK to a public
+   endpoint that streams the PDF. The link is HMAC-signed so it can't be
+   guessed or enumerated. Secret: PDF_SIGNING_SECRET, else the JWT secret. */
+const PDF_SECRET = process.env.PDF_SIGNING_SECRET || process.env.JWT_SECRET || "";
+
+function pdfSig(invoiceId: string): string {
+  return crypto.createHmac("sha256", PDF_SECRET).update(invoiceId).digest("hex").slice(0, 32);
+}
+function pdfSigValid(invoiceId: string, sig: string): boolean {
+  if (!PDF_SECRET || !sig) return false;
+  const a = Buffer.from(sig);
+  const b = Buffer.from(pdfSig(invoiceId));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/* Public base URL of THIS backend, for building the shareable PDF link.
+   PUBLIC_API_URL wins if set; otherwise it's derived from the incoming
+   request — honouring the reverse proxy's X-Forwarded-Host / -Proto — so it
+   resolves to the real domain (e.g. https://api.abhijitart.com) in production
+   with zero config, and to http://localhost:PORT while developing. */
+function resolveApiBase(req: Request): string {
+  const override = (process.env.PUBLIC_API_URL || process.env.API_URL || "").replace(/\/+$/, "");
+  if (override) return override;
+
+  const host = str(req.headers["x-forwarded-host"]) || str(req.headers.host);
+  if (!host) return "";
+
+  const isLocal = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(host);
+  const fwdProto = str(req.headers["x-forwarded-proto"]).split(",")[0].trim();
+  const proto = fwdProto || (isLocal ? "http" : "https");
+  return `${proto}://${host}`;
+}
+
+/* signed, shareable link to an invoice's PDF — null only when there's no
+   signing secret (JWT_SECRET is the fallback) or no resolvable host */
+function invoicePdfUrl(req: Request, invoiceId: string): string | null {
+  if (!PDF_SECRET) return null;
+  const base = resolveApiBase(req);
+  if (!base) return null;
+  return `${base}/api/invoices/${invoiceId}/pdf?sig=${pdfSig(invoiceId)}`;
+}
+
+/* ═══════════════════════ PUBLIC INVOICE PDF ═══════════════════════
+   GET /api/invoices/:id/pdf?sig=...
+
+   PUBLIC and unauthenticated — registered BEFORE the admin guard below, so a
+   client can open it from a WhatsApp link. The HMAC signature is the gate:
+   without the right sig it 403s, and ids can't be enumerated. Streams the same
+   PDF the email attaches, Paid / Balance due included.
+   ─────────────────────────────────────────────────────────── */
+router.get("/:id/pdf", async (req: Request, res: Response) => {
+  try {
+    const id = str(req.params.id);
+    const sig = str(req.query.sig);
+    if (!pdfSigValid(id, sig)) {
+      return res.status(403).json({ message: "Invalid or expired link." });
+    }
+
+    const invoice = await prisma.invoice.findUnique({ where: { id }, include: withPayments });
+    if (!invoice) return res.status(404).json({ message: "Invoice not found." });
+
+    let pdf: Buffer;
+    try {
+      pdf = await buildInvoicePdfFromRecord(invoice);
+    } catch (e) {
+      console.error("Public invoice PDF build failed:", (e as Error).message);
+      return res.status(500).json({ message: "Couldn't generate the invoice PDF." });
+    }
+
+    const safeNo = invoice.invoiceNo.replace(/[^\w.-]+/g, "-") || "invoice";
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="Invoice-${safeNo}.pdf"`);
+    res.setHeader("Cache-Control", "no-store");
+    res.send(pdf);
+  } catch (err) {
+    console.error("Public invoice PDF failed:", err);
+    res.status(500).json({ message: "Couldn't generate the invoice PDF." });
+  }
+});
+
+/* ── everything below is admin-only ──
+   (kept AFTER the public /pdf route above so that link needs no login) */
+router.use(protect, adminOnly);
 
 /* ═══════════════════════ INVOICE EMAIL ═══════════════════════
    POST /api/invoices/email
@@ -365,13 +558,19 @@ router.post("/email", async (req: Request, res: Response) => {
 /* ═══════════════════════ SAVE / STORE INVOICE ═══════════════════════
    POST /api/invoices
      { invNo, date, biz, client, items, discType, discVal, taxPct, notes,
-       warranty, paidAmount }
+       warranty, paidAmount, source, paymentMethod }
 
    Persists the bill into the Invoices history. Called automatically when the
    admin downloads the PDF or emails it. Keyed on invoiceNo. Totals recomputed
-   server-side. paidAmount = the advance received; on a re-save it must NOT wipe
-   a payment logged later, so the incoming advance only wins when set (> 0).
-   Status derived from paid-vs-total; a cancelled invoice stays cancelled.
+   server-side.
+
+   Payments are a LEDGER now: on the FIRST create, an advance (paidAmount > 0)
+   becomes the invoice's first Payment row, tagged with paymentMethod (cash|
+   online) from the Billing toggle. A re-save (Download-then-Email, re-download)
+   NEVER touches payments — it only refreshes the bill's content — so an advance
+   is recorded exactly once. paidAmount + status are always derived from the
+   ledger via recomputeInvoice. source = online|offline (defaults offline, kept
+   on re-save unless a new one is sent).
    Not PIN-gated (staff create bills freely) but the first create is audited.
    ─────────────────────────────────────────────────────────── */
 router.post("/", async (req: Request, res: Response) => {
@@ -379,7 +578,8 @@ router.post("/", async (req: Request, res: Response) => {
     const inv = (req.body || {}) as {
       invNo?: string; date?: string; biz?: Party; client?: Party;
       items?: Line[]; discType?: string; discVal?: unknown; taxPct?: unknown;
-      notes?: string; warranty?: string; paidAmount?: unknown;
+      notes?: string; warranty?: string; paidAmount?: unknown; source?: unknown;
+      paymentMethod?: unknown;
     };
 
     const invoiceNo = str(inv.invNo);
@@ -402,23 +602,18 @@ router.post("/", async (req: Request, res: Response) => {
 
     const createdById = (req as any).user?.id ?? null;
 
-    /* re-save of an existing number? keep any payment already recorded */
     const existing = await prisma.invoice.findUnique({ where: { invoiceNo } });
-    const incomingPaid = clamp(num(inv.paidAmount), 0, total);
-    const paidAmount = existing
-      ? incomingPaid > 0
-        ? incomingPaid
-        : clamp(Number(existing.paidAmount), 0, total)
-      : incomingPaid;
-    const status = existing?.status === "cancelled" ? "cancelled" : deriveStatus(paidAmount, total);
+    const source = asSource(inv.source, existing?.source ?? "offline");
 
-    const data = {
+    /* the bill's content — NOT paidAmount / status (the ledger owns those) */
+    const content = {
       date,
       clientName: str(client.name) || "—",
       clientPhone: str(client.phone) || null,
       clientEmail: str(client.email) || null,
       clientGstin: str(client.gstin) || null,
       clientAddr: str(client.address) || null,
+      source,
       business: {
         name: str(biz.name),
         address: str(biz.address),
@@ -435,61 +630,295 @@ router.post("/", async (req: Request, res: Response) => {
       discountAmt,
       taxAmt,
       total,
-      paidAmount,
-      status: status as "unpaid" | "partial" | "paid" | "cancelled",
       notes: str(inv.notes) || null,
       warranty: str(inv.warranty) || null,
     };
 
-    const saved = existing
-      ? await prisma.invoice.update({ where: { invoiceNo }, data })
-      : await prisma.invoice.create({ data: { invoiceNo, ...data, createdById } });
+    if (existing) {
+      /* re-save: refresh content, leave the ledger alone, re-derive status */
+      await prisma.invoice.update({ where: { invoiceNo }, data: content });
+      const synced = await recomputeInvoice(existing.id, { reactivate: false });
+      return res.status(200).json(synced);
+    }
 
-    /* audit only the first time an invoice number is created — re-saves on
-       every Download/Send would otherwise flood the log */
-    if (!existing) {
-      await logAudit({
-        req, action: "invoice.create", entityId: saved.id, entityRef: invoiceNo,
-        summary: `Created invoice ${invoiceNo} for ${data.clientName} — ${rupee(total)}` +
-          (paidAmount > 0 ? ` (advance ${rupee(paidAmount)})` : ""),
-        detail: { total, paidAmount, status },
+    /* first create: make the invoice, then log the advance (if any) as the
+       first payment, then derive paidAmount/status from the ledger */
+    const created = await prisma.invoice.create({ data: { invoiceNo, ...content, createdById } });
+
+    const advance = clamp(num(inv.paidAmount), 0, total);
+    if (advance > 0.005) {
+      await prisma.payment.create({
+        data: {
+          invoiceId: created.id,
+          amount: advance,
+          method: asMethod(inv.paymentMethod, "cash"),
+          note: "Advance at billing",
+          createdById,
+        },
       });
     }
 
-    res.status(201).json(saved);
+    const synced = await recomputeInvoice(created.id, { reactivate: false });
+
+    await logAudit({
+      req, action: "invoice.create", entityId: created.id, entityRef: invoiceNo,
+      summary: `Created invoice ${invoiceNo} for ${content.clientName} — ${rupee(total)}` +
+        (advance > 0 ? ` (advance ${rupee(advance)} ${asMethod(inv.paymentMethod, "cash")})` : ""),
+      detail: { total, advance, method: advance > 0 ? asMethod(inv.paymentMethod, "cash") : null },
+    });
+
+    res.status(201).json(synced);
   } catch (err) {
     console.error("Invoice save failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't save the invoice." });
   }
 });
 
-/* GET /api/invoices — full records, newest first (history list + re-download) */
-router.get("/", async (_req: Request, res: Response) => {
+/* GET /api/invoices — full records + payment history, newest first.
+   Each carries a signed pdfUrl (derived from this request's host, or
+   PUBLIC_API_URL if set; null only without a signing secret). */
+router.get("/", async (req: Request, res: Response) => {
   try {
-    const invoices = await prisma.invoice.findMany({ orderBy: { createdAt: "desc" } });
-    res.json(invoices);
+    const invoices = await prisma.invoice.findMany({ orderBy: { createdAt: "desc" }, include: withPayments });
+    res.json(invoices.map((inv) => ({ ...inv, pdfUrl: invoicePdfUrl(req, inv.id) })));
   } catch (err) {
     console.error("Invoice list failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't load invoices." });
   }
 });
 
-/* GET /api/invoices/:id — one saved bill */
+/* GET /api/invoices/:id — one saved bill + its payment history (+ signed pdfUrl) */
 router.get("/:id", async (req: Request, res: Response) => {
   try {
     const id = str(req.params.id);
-    const invoice = await prisma.invoice.findUnique({ where: { id } });
+    const invoice = await prisma.invoice.findUnique({ where: { id }, include: withPayments });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
-    res.json(invoice);
+    res.json({ ...invoice, pdfUrl: invoicePdfUrl(req, invoice.id) });
   } catch (err) {
     console.error("Invoice fetch failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't load the invoice." });
   }
 });
 
-/* PATCH /api/invoices/:id/payment — record / update how much has been received.
-   🔒 PIN-gated. Clamps to [0, total], derives the status, un-cancels, audits. */
-router.patch("/:id/payment", async (req: Request, res: Response) => {
+/* ═══════════════════════ PAYMENT REMINDER ═══════════════════════
+   POST /api/invoices/:id/remind
+     { channel: "email" | "whatsapp", subject?, message? }
+
+   Nudges a client about an unpaid / partial balance. Two channels:
+     • email    — sends a premium branded reminder built here (inline CID logo,
+                  an "amount due" card, refined footer) WITH the invoice PDF
+                  attached (rebuilt from the stored snapshot, Paid/Balance
+                  included); needs a client email on file
+     • whatsapp — the browser already opened wa.me with the message (and a
+                  signed PDF link); the server just records that a reminder
+                  went out
+
+   `message` is a short personal NOTE (no figures) — the amount card carries the
+   numbers. Both channels stamp lastRemindedAt + bump reminderCount, write an
+   audit line, and return the updated invoice. Read-only on money (never touches
+   the ledger), so it is NOT PIN-gated. Paid / cancelled / zero-balance bills are
+   refused.
+   ─────────────────────────────────────────────────────────── */
+router.post("/:id/remind", async (req: Request, res: Response) => {
+  try {
+    const id = str(req.params.id);
+    const channel: "email" | "whatsapp" = req.body?.channel === "whatsapp" ? "whatsapp" : "email";
+
+    const invoice = await prisma.invoice.findUnique({ where: { id }, include: withPayments });
+    if (!invoice) return res.status(404).json({ message: "Invoice not found." });
+
+    if (invoice.status === "paid") {
+      return res.status(400).json({ message: "This invoice is already fully paid." });
+    }
+    if (invoice.status === "cancelled") {
+      return res.status(400).json({ message: "This invoice is cancelled — reactivate it before reminding." });
+    }
+
+    const total = Number(invoice.total);
+    const paid = Number(invoice.paidAmount);
+    const balance = round2(Math.max(total - paid, 0));
+    if (balance <= 0.005) {
+      return res.status(400).json({ message: "Nothing due on this invoice." });
+    }
+
+    const subject = str(req.body?.subject) || `Payment reminder — invoice ${invoice.invoiceNo}`;
+    const note = str(req.body?.message) || defaultReminderNote(invoice);
+
+    if (channel === "email") {
+      const to = str(invoice.clientEmail).toLowerCase();
+      if (!to) return res.status(400).json({ message: "No email on file for this client — use WhatsApp instead." });
+      if (!isEmail(to)) return res.status(400).json({ message: "The client's email on file doesn't look right." });
+
+      const biz = (invoice.business || {}) as Party;
+      const bizName = str(biz.name) || "Abhijit Art";
+      const bizAddress = str(biz.address);
+      const bizPhone = str(biz.phone);
+      const bizEmail = str(biz.email);
+      const dateStr = fmtDate(invoice.date.toISOString());
+      const safeNo = invoice.invoiceNo.replace(/[^\w.-]+/g, "-") || "invoice";
+
+      const site = siteUrl();
+      const showSite = /^https?:\/\//i.test(site) && !/localhost|127\.0\.0\.1/i.test(site);
+
+      const noteHtml = note
+        .split(/\n\s*\n/)
+        .map((p) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.65;color:#2a231d">${escapeHtml(p).replace(/\n/g, "<br/>")}</p>`)
+        .join("");
+
+      const logoHtml = reminderLogoPath
+        ? `<img src="cid:aa-logo" alt="${escapeHtml(bizName)}" height="46" style="height:46px;width:auto;display:block;margin:0 auto;border:0" />`
+        : `<div style="font-family:Georgia,'Times New Roman',serif;font-size:24px;font-weight:700;color:#ffffff;letter-spacing:.3px">${escapeHtml(bizName)}</div>
+           <div style="font-size:10.5px;letter-spacing:3px;text-transform:uppercase;color:#c2974a;font-weight:700;margin-top:6px">Printing &amp; Design Studio</div>`;
+
+      const html = `<!doctype html><html><body style="margin:0;padding:0;background:#efe9dc">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#efe9dc;padding:30px 12px">
+          <tr><td align="center">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#fffdf8;border:1px solid #e7ddcb;font-family:'DM Sans',Arial,Helvetica,sans-serif">
+
+              <tr><td style="background:#2a231d;background:linear-gradient(135deg,#2a231d 0%,#3b2f25 100%);padding:26px 28px;text-align:center">
+                ${logoHtml}
+              </td></tr>
+              <tr><td style="height:4px;line-height:4px;font-size:0;background:#d9542f;background:linear-gradient(90deg,#d9542f 0%,#c2974a 100%)">&nbsp;</td></tr>
+
+              <tr><td style="padding:30px 30px 0">
+                <div style="font-size:11px;letter-spacing:2.4px;text-transform:uppercase;color:#c2974a;font-weight:700">Payment reminder</div>
+                <div style="font-family:Georgia,'Times New Roman',serif;font-size:21px;font-weight:700;color:#2a231d;margin-top:6px;letter-spacing:-.2px">Invoice ${escapeHtml(invoice.invoiceNo)}</div>
+              </td></tr>
+
+              <tr><td style="padding:16px 30px 0">${noteHtml}</td></tr>
+
+              <tr><td style="padding:6px 30px 0">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #ecdcc4;border-left:4px solid #d9542f;background:#faf5ea">
+                  <tr><td style="padding:16px 18px">
+                    <div style="font-size:11px;letter-spacing:1.6px;text-transform:uppercase;color:#9a8f81;font-weight:700">Amount due</div>
+                    <div style="font-family:Georgia,'Times New Roman',serif;font-size:30px;font-weight:700;color:#d9542f;line-height:1.1;margin-top:5px">${rupee(balance)}</div>
+                    <div style="font-size:12.5px;color:#6f6357;margin-top:9px">Invoice total <b style="color:#2a231d">${rupee(total)}</b> &nbsp;&middot;&nbsp; Received <b style="color:#2a231d">${rupee(paid)}</b></div>
+                    <div style="font-size:12px;color:#9a8f81;margin-top:3px">Invoice ${escapeHtml(invoice.invoiceNo)} &nbsp;&middot;&nbsp; ${dateStr}</div>
+                  </td></tr>
+                </table>
+              </td></tr>
+
+              <tr><td style="padding:16px 30px 0">
+                <table role="presentation" cellpadding="0" cellspacing="0" width="100%" style="background:#f4f1ea;border:1px solid #e7ddcb">
+                  <tr>
+                    <td width="42" style="padding:11px 0 11px 14px;font-size:18px;vertical-align:middle">📎</td>
+                    <td style="padding:11px 14px 11px 8px;font-size:13px;color:#2a231d;vertical-align:middle">The full invoice is attached as a PDF (<b>Invoice-${escapeHtml(safeNo)}.pdf</b>) for your records.</td>
+                  </tr>
+                </table>
+              </td></tr>
+
+              <tr><td style="padding:26px 30px 28px">
+                <div style="border-top:1px solid #ecdcc4;padding-top:18px;text-align:center">
+                  <div style="font-family:Georgia,'Times New Roman',serif;font-size:16px;font-weight:700;color:#2a231d">${escapeHtml(bizName)}</div>
+                  <div style="font-size:12px;color:#9a8f81;margin-top:3px">${escapeLines(bizAddress) || "Berhampore, West Bengal"}</div>
+                  <div style="font-size:12px;color:#6f6357;margin-top:8px">${bizPhone ? `&#9742; ${escapeHtml(bizPhone)}` : ""}${bizPhone && bizEmail ? " &nbsp;&middot;&nbsp; " : ""}${bizEmail ? `&#9993; ${escapeHtml(bizEmail)}` : ""}</div>
+                  ${showSite ? `<div style="margin-top:9px"><a href="${escapeHtml(site)}" style="color:#d9542f;text-decoration:none;font-size:12px;font-weight:600">${escapeHtml(site.replace(/^https?:\/\//i, ""))}</a></div>` : ""}
+                </div>
+                <div style="font-size:11px;color:#b6ac9c;line-height:1.6;margin-top:14px;text-align:center">You're receiving this because you have an outstanding balance with ${escapeHtml(bizName)}. Reply to this email with any questions.</div>
+              </td></tr>
+
+            </table>
+          </td></tr>
+        </table>
+      </body></html>`;
+
+      const text =
+        note + "\n\n" +
+        `AMOUNT DUE: ${rupee(balance)}\n` +
+        `Invoice total: ${rupee(total)}  ·  Received: ${rupee(paid)}\n` +
+        `Invoice ${invoice.invoiceNo}  ·  ${dateStr}\n\n` +
+        `The full invoice is attached as a PDF.\n\n` +
+        `${bizName}\n${bizAddress || "Berhampore, West Bengal"}` +
+        (bizPhone ? `\n${bizPhone}` : "") +
+        (bizEmail ? `\n${bizEmail}` : "");
+
+      /* attach the invoice PDF, rebuilt from the stored snapshot — non-fatal:
+         if the PDF can't be built, the reminder still goes out */
+      let pdf: Buffer | null = null;
+      try {
+        pdf = await buildInvoicePdfFromRecord(invoice);
+      } catch (e) {
+        console.warn("🔔 reminder PDF build failed — sending without attachment:", (e as Error).message);
+      }
+
+      const attachments: any[] = [];
+      if (pdf) attachments.push({ filename: `Invoice-${safeNo}.pdf`, content: pdf, contentType: "application/pdf" });
+      if (reminderLogoPath) {
+        attachments.push({
+          filename: "logo.png",
+          path: reminderLogoPath,
+          cid: "aa-logo",
+          contentDisposition: "inline" as const,
+          contentType: "image/png",
+        });
+      }
+
+      const info = (await transporter.sendMail({
+        from: mailFrom(),
+        to,
+        replyTo: bizEmail || process.env.SMTP_USER || undefined,
+        subject,
+        html,
+        text,
+        attachments,
+      })) as { rejected?: (string | { address: string })[]; messageId?: string; response?: string };
+
+      const addr = (a: string | { address: string }) => (typeof a === "string" ? a : a.address);
+      if ((info.rejected || []).some((a) => addr(a).toLowerCase() === to)) {
+        console.error(`🔔 reminder REJECTED  ${to} — ${info.response || "recipient refused"}`);
+        return res.status(502).json({ message: info.response || "The mail server refused that address." });
+      }
+      console.log(
+        `🔔 reminder ${invoice.invoiceNo} emailed  ${to}  ` +
+        `pdf=${pdf ? (pdf.length / 1024).toFixed(0) + "kb" : "none"}  id=${info.messageId || "?"}  ${info.response || ""}`,
+      );
+    }
+
+    /* stamp the touch — both channels */
+    const updated = await prisma.invoice.update({
+      where: { id },
+      data: { lastRemindedAt: new Date(), reminderCount: { increment: 1 } },
+      include: withPayments,
+    });
+
+    await logAudit({
+      req, action: "invoice.remind", entityId: invoice.id, entityRef: invoice.invoiceNo,
+      summary: `Reminder sent via ${channel} for ${invoice.invoiceNo} — balance ${rupee(balance)}`,
+      detail: {
+        channel,
+        balance,
+        to: channel === "email" ? invoice.clientEmail : invoice.clientPhone,
+        reminderCount: updated.reminderCount,
+      },
+    });
+
+    res.json({ ...updated, pdfUrl: invoicePdfUrl(req, updated.id) });
+  } catch (err) {
+    if ((err as { code?: string }).code === "P2025") {
+      return res.status(404).json({ message: "Invoice not found." });
+    }
+    console.error("Invoice reminder failed:", err);
+    res.status(500).json({ message: (err as Error).message || "Couldn't send the reminder." });
+  }
+});
+
+/* ═══════════════════════ EDIT INVOICE CONTENTS ═══════════════════════
+   PATCH /api/invoices/:id/edit
+     { date?, client, items, discType, discVal, taxPct, notes, warranty,
+       source, pin }
+
+   Edits a saved bill in place (client details, line items, discount/GST,
+   notes, source) so a recurring customer's running bill can grow instead of
+   spawning ten separate invoices. 🔒 PIN-gated + audited. Payment method is
+   NOT here any more — it lives on each payment.
+
+   LOCKED: only unpaid / partial bills are editable — paid and cancelled return
+   403. invoiceNo + the business snapshot are immutable. Totals are recomputed
+   server-side; the ledger is untouched, and paidAmount / status are re-derived
+   against the new total (so adding a line to a partial bill keeps the payments
+   and just grows the balance due).
+   ─────────────────────────────────────────────────────────── */
+router.patch("/:id/edit", async (req: Request, res: Response) => {
   try {
     const pe = await pinError(req);
     if (pe) return res.status(pe.code).json({ message: pe.message });
@@ -498,37 +927,182 @@ router.patch("/:id/payment", async (req: Request, res: Response) => {
     const invoice = await prisma.invoice.findUnique({ where: { id } });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
 
-    const total = Number(invoice.total);
-    const prev = Number(invoice.paidAmount);
-    const paidAmount = clamp(num(req.body.paidAmount), 0, total);
-    const status = deriveStatus(paidAmount, total);
+    if (invoice.status === "paid") {
+      return res.status(403).json({ message: "This invoice is paid and locked. Delete and recreate it to make a correction." });
+    }
+    if (invoice.status === "cancelled") {
+      return res.status(403).json({ message: "This invoice is cancelled. Reactivate it (record a payment) before editing." });
+    }
 
-    const updated = await prisma.invoice.update({
+    const body = (req.body || {}) as {
+      date?: string; client?: Party; items?: Line[];
+      discType?: string; discVal?: unknown; taxPct?: unknown;
+      notes?: string; warranty?: string; source?: unknown;
+    };
+
+    const client: Party = body.client || {};
+
+    const lines = (Array.isArray(body.items) ? body.items : []).filter(
+      (it) => str(it.desc) || num(it.rate) > 0,
+    );
+    if (!lines.length) return res.status(400).json({ message: "Add at least one line item before saving." });
+
+    const { subtotal, discVal, discountAmt, taxPct, taxAmt, total } = computeTotals(
+      lines, body.discType, body.discVal, body.taxPct,
+    );
+
+    const whenRaw = str(body.date);
+    const when = new Date(whenRaw);
+    const date = whenRaw && !isNaN(when.getTime()) ? when : invoice.date;
+
+    const source = asSource(body.source, invoice.source);
+
+    await prisma.invoice.update({
       where: { id },
-      data: { paidAmount, status },
+      data: {
+        date,
+        clientName: str(client.name) || "—",
+        clientPhone: str(client.phone) || null,
+        clientEmail: str(client.email) || null,
+        clientGstin: str(client.gstin) || null,
+        clientAddr: str(client.address) || null,
+        source,
+        items: lines.map((it) => ({ desc: str(it.desc), qty: num(it.qty), rate: num(it.rate) })),
+        discType: (body.discType === "percent" ? "percent" : "amount") as "amount" | "percent",
+        discVal,
+        taxPct,
+        subtotal,
+        discountAmt,
+        taxAmt,
+        total,
+        notes: str(body.notes) || null,
+        warranty: str(body.warranty) || null,
+      },
     });
+
+    /* new total → re-derive paidAmount + status from the untouched ledger */
+    const updated = await recomputeInvoice(id, { reactivate: false });
+    const paidAmount = updated ? Number(updated.paidAmount) : 0;
 
     await logAudit({
-      req, action: "invoice.payment", entityId: invoice.id, entityRef: invoice.invoiceNo,
-      summary: `Payment on ${invoice.invoiceNo}: ${rupee(prev)} → ${rupee(paidAmount)} (balance ${rupee(Math.max(total - paidAmount, 0))})`,
-      detail: { previous: prev, received: paidAmount, total, balanceDue: Math.max(total - paidAmount, 0), status },
+      req, action: "invoice.edit", entityId: invoice.id, entityRef: invoice.invoiceNo,
+      summary: `Edited invoice ${invoice.invoiceNo} for ${str(client.name) || "—"} — now ${rupee(total)}` +
+        (paidAmount > 0 ? ` (paid ${rupee(paidAmount)}, balance ${rupee(Math.max(total - paidAmount, 0))})` : ""),
+      detail: {
+        before: { total: Number(invoice.total), status: invoice.status, items: invoice.items },
+        after: { total, itemCount: lines.length },
+        paidAmount,
+      },
     });
 
-    res.json(updated);
+    res.json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null });
   } catch (err) {
     if ((err as { code?: string }).code === "P2025") {
       return res.status(404).json({ message: "Invoice not found." });
     }
-    console.error("Invoice payment update failed:", err);
-    res.status(500).json({ message: (err as Error).message || "Couldn't update the payment." });
+    console.error("Invoice edit failed:", err);
+    res.status(500).json({ message: (err as Error).message || "Couldn't save the changes." });
   }
 });
 
-/* PATCH /api/invoices/:id/status — unpaid / partial / paid / cancelled.
-   🔒 PIN-gated (all status changes alter money/state).
-     paid   → received = total      unpaid → received = 0
-     cancelled leaves the received amount untouched.
-   "partial" isn't settable directly — it comes from an amount (/payment). */
+/* ═══════════════════════ RECORD A PAYMENT ═══════════════════════
+   POST /api/invoices/:id/payments
+     { amount, method, note?, pin }
+
+   Appends one payment to the invoice's ledger — how much, and cash|online.
+   🔒 PIN-gated + audited. The amount is clamped to the outstanding balance
+   (you can't overpay), recording money un-cancels a cancelled bill, and
+   paidAmount / status are re-derived from the whole ledger.
+   ─────────────────────────────────────────────────────────── */
+router.post("/:id/payments", async (req: Request, res: Response) => {
+  try {
+    const pe = await pinError(req);
+    if (pe) return res.status(pe.code).json({ message: pe.message });
+
+    const id = str(req.params.id);
+    const invoice = await prisma.invoice.findUnique({ where: { id }, include: withPayments });
+    if (!invoice) return res.status(404).json({ message: "Invoice not found." });
+
+    const total = Number(invoice.total);
+    const currentPaid = clamp(round2(invoice.payments.reduce((s, p) => s + Number(p.amount), 0)), 0, total);
+    const remaining = round2(Math.max(total - currentPaid, 0));
+    if (remaining <= 0.005) {
+      return res.status(400).json({ message: "This invoice is already fully paid." });
+    }
+
+    const amount = clamp(round2(num(req.body.amount)), 0, remaining);
+    if (amount <= 0.005) {
+      return res.status(400).json({ message: "Enter a payment amount greater than zero." });
+    }
+
+    const method = asMethod(req.body.method, "cash");
+    const note = str(req.body.note);
+    const createdById = (req as any).user?.id ?? null;
+
+    await prisma.payment.create({
+      data: { invoiceId: id, amount, method, note: note || null ? note : "", createdById },
+    });
+
+    /* recording money reactivates a cancelled bill */
+    const updated = await recomputeInvoice(id, { reactivate: true });
+    const balance = updated ? round2(Math.max(total - Number(updated.paidAmount), 0)) : 0;
+
+    await logAudit({
+      req, action: "invoice.payment", entityId: invoice.id, entityRef: invoice.invoiceNo,
+      summary: `Payment on ${invoice.invoiceNo}: ${rupee(amount)} ${method} (balance ${rupee(balance)})`,
+      detail: { amount, method, note, balanceDue: balance, status: updated?.status },
+    });
+
+    res.status(201).json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null });
+  } catch (err) {
+    if ((err as { code?: string }).code === "P2025") {
+      return res.status(404).json({ message: "Invoice not found." });
+    }
+    console.error("Invoice payment failed:", err);
+    res.status(500).json({ message: (err as Error).message || "Couldn't record the payment." });
+  }
+});
+
+/* DELETE /api/invoices/:id/payments/:paymentId — remove a wrong ledger entry.
+   🔒 PIN-gated + audited. paidAmount / status are re-derived afterwards.
+   Send the PIN in the body: api.delete(url, { data: { pin } }). */
+router.delete("/:id/payments/:paymentId", async (req: Request, res: Response) => {
+  try {
+    const pe = await pinError(req);
+    if (pe) return res.status(pe.code).json({ message: pe.message });
+
+    const id = str(req.params.id);
+    const paymentId = str(req.params.paymentId);
+
+    const payment = await prisma.payment.findUnique({ where: { id: paymentId } });
+    if (!payment || payment.invoiceId !== id) {
+      return res.status(404).json({ message: "Payment not found on this invoice." });
+    }
+
+    await prisma.payment.delete({ where: { id: paymentId } });
+
+    const updated = await recomputeInvoice(id, { reactivate: false });
+
+    await logAudit({
+      req, action: "invoice.payment.delete", entityId: id, entityRef: updated?.invoiceNo ?? id,
+      summary: `Removed a ${rupee(Number(payment.amount))} ${payment.method} payment from ${updated?.invoiceNo ?? "invoice"}`,
+      detail: { amount: Number(payment.amount), method: payment.method, status: updated?.status },
+    });
+
+    res.json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null });
+  } catch (err) {
+    if ((err as { code?: string }).code === "P2025") {
+      return res.status(404).json({ message: "Payment not found." });
+    }
+    console.error("Invoice payment delete failed:", err);
+    res.status(500).json({ message: (err as Error).message || "Couldn't remove the payment." });
+  }
+});
+
+/* PATCH /api/invoices/:id/status — cancel or reactivate a bill.
+   🔒 PIN-gated. "cancelled" voids the bill (its payments stay recorded);
+   any other value reactivates it and re-derives the status from the ledger.
+   The paid/unpaid state itself is NOT set here — it follows the payments. */
 const STATUSES = ["unpaid", "partial", "paid", "cancelled"] as const;
 router.patch("/:id/status", async (req: Request, res: Response) => {
   try {
@@ -536,9 +1110,6 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
     if (!(STATUSES as readonly string[]).includes(status)) {
       return res.status(400).json({ message: "Status must be unpaid, partial, paid or cancelled." });
     }
-    if (status === "partial") {
-      return res.status(400).json({ message: "To set a partial payment, record the received amount via the payment action." });
-    }
 
     const pe = await pinError(req);
     if (pe) return res.status(pe.code).json({ message: pe.message });
@@ -547,23 +1118,28 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
     const invoice = await prisma.invoice.findUnique({ where: { id } });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
 
-    const total = Number(invoice.total);
-    const data: { status: (typeof STATUSES)[number]; paidAmount?: number } = {
-      status: status as (typeof STATUSES)[number],
-    };
-    if (status === "paid") data.paidAmount = total;
-    else if (status === "unpaid") data.paidAmount = 0;
+    if (status === "cancelled") {
+      const updated = await prisma.invoice.update({
+        where: { id },
+        data: { status: "cancelled" },
+        include: withPayments,
+      });
+      await logAudit({
+        req, action: "invoice.cancel", entityId: invoice.id, entityRef: invoice.invoiceNo,
+        summary: `Cancelled invoice ${invoice.invoiceNo}`,
+        detail: { from: invoice.status, to: "cancelled" },
+      });
+      return res.json({ ...updated, pdfUrl: invoicePdfUrl(req, updated.id) });
+    }
 
-    const updated = await prisma.invoice.update({ where: { id }, data });
-
-    const isCancel = status === "cancelled";
+    /* anything non-cancelled = reactivate → status follows the ledger */
+    const updated = await recomputeInvoice(id, { reactivate: true });
     await logAudit({
-      req, action: isCancel ? "invoice.cancel" : "invoice.status", entityId: invoice.id, entityRef: invoice.invoiceNo,
-      summary: isCancel ? `Cancelled invoice ${invoice.invoiceNo}` : `Marked invoice ${invoice.invoiceNo} ${status}`,
-      detail: { from: invoice.status, to: status },
+      req, action: "invoice.status", entityId: invoice.id, entityRef: invoice.invoiceNo,
+      summary: `Reactivated invoice ${invoice.invoiceNo} → ${updated?.status}`,
+      detail: { from: invoice.status, to: updated?.status },
     });
-
-    res.json(updated);
+    res.json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null });
   } catch (err) {
     if ((err as { code?: string }).code === "P2025") {
       return res.status(404).json({ message: "Invoice not found." });
@@ -573,7 +1149,8 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
   }
 });
 
-/* DELETE /api/invoices/:id — remove a saved bill. 🔒 PIN-gated + audited.
+/* DELETE /api/invoices/:id — remove a saved bill (and its payments, via the
+   schema's onDelete: Cascade). 🔒 PIN-gated + audited.
    Send the PIN in the request body: api.delete(url, { data: { pin } }). */
 router.delete("/:id", async (req: Request, res: Response) => {
   try {

@@ -29,6 +29,7 @@ const FAINT = "#b6bac3";
 const LINE = "#ececf1";
 const SOFT = "#fafbfc";
 const TERRA = "#d9542f";
+const GREEN = "#2f7d52"; // "Paid" line — money received
 
 export type PdfParty = {
   name?: string; address?: string; phone?: string; email?: string; gstin?: string; pan?: string;
@@ -46,6 +47,8 @@ export type PdfInvoice = {
   taxAmt: number;
   taxLabel: string;      // e.g. "GST (9%)"
   total: number;
+  paidAmount?: number;   // money received so far — when > 0 the PDF shows
+                         // Paid + Balance due under Total (matches the app)
   notes?: string;
   warranty?: string;
   siteUrl?: string;
@@ -243,15 +246,16 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
 
       /* ── totals ── */
       y += 14;
-      if (y + 90 > PAGE_BOTTOM) { doc.addPage(); y = M; }
+      // reserve room for subtotal/disc/tax + Total + (Paid + Balance due)
+      if (y + 140 > PAGE_BOTTOM) { doc.addPage(); y = M; }
 
       const TL = M + 300;              // label column left edge
-      const row = (label: string, value: string, strong = false) => {
+      const row = (label: string, value: string, strong = false, valueColor?: string) => {
         doc.font(strong ? F_BOLD : F_REG).fontSize(strong ? 12 : 9.5)
           .fillColor(strong ? INK : MUTE)
           .text(label, TL, y, { width: 120 });
         doc.font(F_BOLD).fontSize(strong ? 13 : 9.5)
-          .fillColor(strong ? TERRA : INK)
+          .fillColor(valueColor ? valueColor : (strong ? TERRA : INK))
           .text(value, C_AMT_R - 120, y, { width: 120, align: "right" });
         y += strong ? 20 : 15;
       };
@@ -263,6 +267,15 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
       doc.moveTo(TL, y + 2).lineTo(RIGHT, y + 2).lineWidth(0.8).stroke(LINE);
       y += 10;
       row("Total", money(inv.total), true);
+
+      /* Paid + Balance due — only when something has been received, so a
+         fully-unpaid bill still reads exactly as before */
+      const paid = Number.isFinite(inv.paidAmount as number) ? Number(inv.paidAmount) : 0;
+      if (paid > 0.005) {
+        const balance = Math.max(Number(inv.total) - paid, 0);
+        row("Paid", `- ${money(paid)}`, false, GREEN);
+        row("Balance due", money(balance), true);
+      }
 
       /* ── notes / warranty ── */
       if ((inv.notes || "").trim() || (inv.warranty || "").trim()) {
