@@ -266,7 +266,7 @@ router.use(protect, adminOnly);
 /* ═══════════════════════ INVOICE EMAIL ═══════════════════════
    POST /api/invoices/email
      { to, subject, message, invoice: { invNo, date, biz, client, items,
-       discType, discVal, taxPct, notes, warranty } }
+       discType, discVal, taxPct, notes, warranty, paidAmount } }
 
    The client gets BOTH: the invoice rendered inline as email-safe table HTML
    (readable straight away, no download needed) and a real PDF attachment built
@@ -274,7 +274,8 @@ router.use(protect, adminOnly);
 
    Totals are recomputed from the line items on the server, so the emailed
    figures and the PDF can never disagree with the arithmetic, whatever the
-   browser posted.
+   browser posted. If the caller passes paidAmount (an advance / part payment),
+   both the inline totals AND the attached PDF show Paid + Balance due.
    ─────────────────────────────────────────────────────────── */
 router.post("/email", async (req: Request, res: Response) => {
   try {
@@ -284,7 +285,7 @@ router.post("/email", async (req: Request, res: Response) => {
     const inv = (req.body.invoice || {}) as {
       invNo?: string; date?: string; biz?: Party; client?: Party;
       items?: Line[]; discType?: string; discVal?: unknown; taxPct?: unknown;
-      notes?: string; warranty?: string;
+      notes?: string; warranty?: string; paidAmount?: unknown;
     };
 
     if (!to) return res.status(400).json({ message: "Recipient email is required." });
@@ -306,6 +307,11 @@ router.post("/email", async (req: Request, res: Response) => {
       lines, inv.discType, inv.discVal, inv.taxPct,
     );
 
+    /* advance / part payment already received (supplied by the caller) —
+       clamped to the total so the emailed Paid / Balance due stay in range */
+    const paidAmount = clamp(round2(num(inv.paidAmount)), 0, total);
+    const balanceDue = round2(Math.max(total - paidAmount, 0));
+
     const site = siteUrl();
 
     const rows = lines
@@ -325,13 +331,28 @@ router.post("/email", async (req: Request, res: Response) => {
         <td style="padding:${strong ? "12px" : "6px"} 4px 6px;font-size:${strong ? "16px" : "13px"};text-align:right;font-weight:${strong ? 800 : 700};color:${strong ? "#d9542f" : "#1f2430"};${strong ? "border-top:1px solid #ececf1;" : ""}">${value}</td>
       </tr>`;
 
+    /* Paid (green) + Balance due (bold terracotta), shown only when an advance
+       / part payment was received — mirrors the printed PDF + the Invoices page */
+    const paidRows =
+      paidAmount > 0.005
+        ? `<tr>
+             <td style="padding:6px 4px;font-size:12.5px;color:#8a8f9a">Paid</td>
+             <td style="padding:6px 4px;font-size:13px;text-align:right;font-weight:700;color:#15733f">− ${rupee(paidAmount)}</td>
+           </tr>
+           <tr>
+             <td style="padding:9px 4px 6px;font-size:14px;color:#1f2430;font-weight:800">Balance due</td>
+             <td style="padding:9px 4px 6px;font-size:15px;text-align:right;font-weight:800;color:#d9542f">${rupee(balanceDue)}</td>
+           </tr>`
+        : "";
+
     const totalsHtml =
       totalRow("Subtotal", rupee(subtotal)) +
       (discountAmt > 0
         ? totalRow(`Discount${inv.discType === "percent" ? ` (${discVal}%)` : ""}`, "− " + rupee(discountAmt))
         : "") +
       (taxPct > 0 ? totalRow(`GST (${taxPct}%)`, rupee(taxAmt)) : "") +
-      totalRow("Total", rupee(total), true);
+      totalRow("Total", rupee(total), true) +
+      paidRows;
 
     const messageHtml = message
       ? message
@@ -451,7 +472,9 @@ router.post("/email", async (req: Request, res: Response) => {
       `\n\nSubtotal: ${rupee(subtotal)}` +
       (discountAmt > 0 ? `\nDiscount: -${rupee(discountAmt)}` : "") +
       (taxPct > 0 ? `\nGST (${taxPct}%): ${rupee(taxAmt)}` : "") +
-      `\nTOTAL: ${rupee(total)}\n\n` +
+      `\nTOTAL: ${rupee(total)}` +
+      (paidAmount > 0.005 ? `\nPaid: -${rupee(paidAmount)}\nBalance due: ${rupee(balanceDue)}` : "") +
+      `\n\n` +
       (str(inv.notes) ? `Notes: ${str(inv.notes)}\n` : "") +
       (str(inv.warranty) ? `Warranty: ${str(inv.warranty)}\n` : "") +
       `\nA printable PDF copy is attached to this email.\n` +
@@ -459,7 +482,8 @@ router.post("/email", async (req: Request, res: Response) => {
 
     /* Build a real PDF so the client gets a file they can save, print or
        forward to their accountant — the inline HTML above is for reading,
-       the attachment is the document of record. */
+       the attachment is the document of record. paidAmount makes the PDF show
+       Paid / Balance due too, matching the inline totals. */
     const discountLabel = `Discount${inv.discType === "percent" ? ` (${discVal}%)` : ""}`;
     const pdf = await buildInvoicePdf({
       invNo: str(inv.invNo),
@@ -477,6 +501,7 @@ router.post("/email", async (req: Request, res: Response) => {
       taxAmt,
       taxLabel: `GST (${taxPct}%)`,
       total,
+      paidAmount,
       notes: str(inv.notes),
       warranty: str(inv.warranty),
       siteUrl: site,
@@ -545,7 +570,7 @@ router.post("/email", async (req: Request, res: Response) => {
     await logAudit({
       req, action: "invoice.email", entityRef: str(inv.invNo),
       summary: `Emailed invoice ${str(inv.invNo) || "(no number)"} to ${to}`,
-      detail: { to, total },
+      detail: { to, total, paidAmount, balanceDue },
     });
 
     res.json({ ok: true, messageId: info.messageId, total, pdfBytes: pdf.length });
