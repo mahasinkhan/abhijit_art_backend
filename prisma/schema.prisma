@@ -12,6 +12,7 @@ datasource db {
 enum Role {
   client
   admin
+  employee
 }
 
 enum BookingStatus {
@@ -70,6 +71,24 @@ enum PaymentMethod {
   online
 }
 
+// ─────────────────────────────── TASKS ───────────────────────────────
+
+// lifecycle of an employee task
+enum TaskStatus {
+  pending
+  in_progress
+  completed
+  cancelled
+}
+
+// urgency set by the admin when assigning
+enum TaskPriority {
+  low
+  medium
+  high
+  urgent
+}
+
 model User {
   id             String          @id @default(cuid())
   name           String
@@ -82,6 +101,8 @@ model User {
   invoices       Invoice[]
   payments       Payment[]
   auditLogs      AuditLog[]
+  tasksAssigned  Task[]          @relation("TasksAssigned")
+  tasksCreated   Task[]          @relation("TasksCreated")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   address String?
@@ -337,6 +358,57 @@ model Payment {
   createdAt DateTime @default(now())
 
   @@index([invoiceId, createdAt])
+}
+
+// ─────────────────────────────── TASKS ───────────────────────────────
+
+// A task the admin assigns to an employee. Carries the instructions,
+// reference images (uploaded → /uploads/tasks/…) and reference links, plus
+// the priority/deadline. The employee updates status + notes as they work;
+// every change is broadcast over Socket.IO so admin sees progress live.
+model Task {
+  id          String       @id @default(cuid())
+  title       String
+  description String?
+  images      String[]     // uploaded reference image paths, e.g. /uploads/tasks/xxx.jpg
+  links       String[]     // external reference links (Drive, refs, etc.)
+  priority    TaskPriority @default(medium)
+  status      TaskStatus   @default(pending)
+  deadline    DateTime?
+  notes       String?      // employee's progress / completion notes
+
+  // progress-timeline timestamps, set by the backend on status change:
+  // createdAt = assigned, startedAt = moved to in_progress, completedAt = done
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  // customer work-order details — this task is tied to a customer job.
+  // Stored as a snapshot (like an invoice's client fields) so the order
+  // always shows who it was for, even if the customer record changes.
+  customerName  String?
+  customerPhone String?
+  customerEmail String?
+  orderDate     DateTime?  // when the customer placed the order
+  amount        Int       @default(0)  // total order value in ₹ (fetched from the bill)
+  advancePaid   Int       @default(0)  // advance received in ₹; due = amount − advancePaid
+
+  // the bill this task was created from — amount + customer + items come from it
+  invoiceId     String?
+  invoiceNo     String?
+
+  // the employee this task is assigned to
+  assignedTo   User   @relation("TasksAssigned", fields: [assignedToId], references: [id])
+  assignedToId String
+  // the admin who created / assigned it
+  createdBy    User   @relation("TasksCreated", fields: [createdById], references: [id])
+  createdById  String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([assignedToId, status])
+  @@index([status])
+  @@index([createdAt])
 }
 
 // ───────────────────────── SECURITY / AUDIT ─────────────────────────

@@ -1,6 +1,7 @@
 // backend/src/routes/userRoutes.ts
 import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
+import bcrypt from "bcryptjs";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.js";
@@ -191,6 +192,109 @@ router.delete("/:id", async (req: Request, res: Response) => {
   }
 });
 
+/* ═══════════════════════ EMPLOYEE MANAGEMENT ═══════════════════════
+   POST   /api/users/employee        — create employee account
+   PATCH  /api/users/employee/:id    — edit name / phone / password
+   DELETE /api/users/employee/:id    — remove employee + their tasks
+   GET    /api/users/employees       — list all employees (with task count)
+   ──────────────────────────────────────────────────────────────────── */
+
+/* POST /api/users/employee — admin creates a new employee account */
+router.post("/employee", async (req: Request, res: Response) => {
+  try {
+    const name     = str(req.body.name);
+    const email    = str(req.body.email).toLowerCase();
+    const phone    = str(req.body.phone);
+    const password = str(req.body.password);
+
+    if (!name || !email || !password)
+      return res.status(400).json({ error: "name, email and password are required" });
+    if (password.length < 6)
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    if (!isEmail(email))
+      return res.status(400).json({ error: "That email doesn't look right." });
+
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing)
+      return res.status(409).json({ error: "An account with this email already exists" });
+
+    const hashed = await bcrypt.hash(password, 10);
+    const employee = await prisma.user.create({
+      data: {
+        name,
+        email,
+        phone: phone || "",
+        password: hashed,
+        role: "employee",
+        source: "offline",
+      },
+      select: {
+        id: true, name: true, email: true, phone: true,
+        role: true, createdAt: true,
+        _count: { select: { tasksAssigned: true } },
+      },
+    });
+
+    res.status(201).json(employee);
+  } catch (err: any) {
+    console.error("Employee create failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* PATCH /api/users/employee/:id — edit name / phone / reset password */
+router.patch("/employee/:id", async (req: Request, res: Response) => {
+  try {
+    const existing = await prisma.user.findUnique({ where: { id: String(req.params.id) } });
+    if (!existing || existing.role !== "employee")
+      return res.status(404).json({ error: "Employee not found" });
+
+    const { name, phone, password } = req.body;
+    const data: Prisma.UserUpdateInput = {};
+
+    if (name  !== undefined) data.name  = str(name);
+    if (phone !== undefined) data.phone = str(phone);
+    if (password) {
+      if (str(password).length < 6)
+        return res.status(400).json({ error: "Password must be at least 6 characters" });
+      data.password = await bcrypt.hash(str(password), 10);
+    }
+
+    const updated = await prisma.user.update({
+      where: { id: String(req.params.id) },
+      data,
+      select: {
+        id: true, name: true, email: true, phone: true,
+        role: true, createdAt: true,
+        _count: { select: { tasksAssigned: true } },
+      },
+    });
+
+    res.json(updated);
+  } catch (err: any) {
+    console.error("Employee update failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* DELETE /api/users/employee/:id — removes employee and their assigned tasks */
+router.delete("/employee/:id", async (req: Request, res: Response) => {
+  try {
+    const existing = await prisma.user.findUnique({ where: { id: String(req.params.id) } });
+    if (!existing || existing.role !== "employee")
+      return res.status(404).json({ error: "Employee not found" });
+
+    // Delete their assigned tasks first (assignedToId is required on Task)
+    await prisma.task.deleteMany({ where: { assignedToId: String(req.params.id) } });
+    await prisma.user.delete({ where: { id: String(req.params.id) } });
+
+    res.json({ success: true });
+  } catch (err: any) {
+    console.error("Employee delete failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 /* ═══════════════════════════════ EMAIL ═══════════════════════════════
    POST /api/users/email
      { userIds: string[], subject, message, buttonText?, buttonLink? }
@@ -224,23 +328,19 @@ const fillTokens = (t: string, full: string, first: string) =>
 
 router.post("/email", async (req: Request, res: Response) => {
   try {
-    /* Accept BOTH the new field names and the older ones the EmailDrawer may
-       still be sending (message⇄body, buttonText⇄ctaLabel, buttonLink⇄ctaUrl),
-       so a not-yet-updated frontend doesn't trip a false "Message is required".
-       Once the frontend sends the new names, delete the three legacy aliases. */
     const _b = req.body as {
       userIds?: string[];
       subject?: string;
       message?: string;
-      body?: string; // legacy alias → message
+      body?: string;
       buttonText?: string;
-      ctaLabel?: string; // legacy alias → buttonText
+      ctaLabel?: string;
       buttonLink?: string;
-      ctaUrl?: string; // legacy alias → buttonLink
+      ctaUrl?: string;
     };
-    const userIds = _b.userIds;
-    const subject = _b.subject;
-    const message = _b.message ?? _b.body;
+    const userIds    = _b.userIds;
+    const subject    = _b.subject;
+    const message    = _b.message ?? _b.body;
     const buttonText = _b.buttonText ?? _b.ctaLabel;
     const buttonLink = _b.buttonLink ?? _b.ctaUrl;
 
@@ -256,8 +356,6 @@ router.post("/email", async (req: Request, res: Response) => {
       select: { id: true, name: true, email: true },
     });
 
-    /* Fail fast with the REAL reason if SMTP auth/connection is broken, instead
-       of N identical per-recipient errors — this surfaces straight to the modal. */
     try {
       await transporter.verify();
     } catch (e: any) {
@@ -267,7 +365,6 @@ router.post("/email", async (req: Request, res: Response) => {
       });
     }
 
-    /* Public URLs for the branded shell — NEVER the localhost dev URL. */
     const siteUrl = process.env.PUBLIC_SITE_URL || "https://abhijitart.com";
     const logoUrl = process.env.EMAIL_LOGO_URL || undefined;
 
@@ -275,17 +372,13 @@ router.post("/email", async (req: Request, res: Response) => {
     const failures: { email: string; error: string }[] = [];
     const skipped: string[] = [];
 
-    // one personalised email per recipient, paced so Gmail SMTP doesn't throttle
     for (const u of users) {
       const to = (u.email || "").trim();
-      if (!to) {
-        skipped.push(u.name || u.id); // no address on file → skip
-        continue;
-      }
+      if (!to) { skipped.push(u.name || u.id); continue; }
 
       const first = firstNameOf(u.name);
-      const subj = fillTokens(subject!, u.name, first);
-      const body = fillTokens(message!, u.name, first);
+      const subj  = fillTokens(subject!, u.name, first);
+      const body  = fillTokens(message!, u.name, first);
 
       const html = renderCustomerEmail({
         subject: subj,
@@ -300,24 +393,15 @@ router.post("/email", async (req: Request, res: Response) => {
       });
 
       try {
-        /* ── OPTIONAL EXTRAS (kept from your earlier version) ──────────────
-           If you want the bare send, drop `text` + `headers` below and the
-           accepted/rejected block, and replace the whole try with:
-             await transporter.sendMail({ from: MAIL_FROM, to, subject: subj, html });
-             sent += 1;
-           ------------------------------------------------------------------ */
         const info = (await transporter.sendMail({
           from: MAIL_FROM,
           to,
           subject: subj,
           html,
-          // plain-text fallback for HTML-blocking clients (also helps the spam score)
           text:
             body +
             `\n\n—\nAbhijit Art · Berhampore, West Bengal\n${siteUrl}\n` +
             `You're receiving this because you're a customer. Reply "unsubscribe" to opt out.`,
-          /* Gmail leans on List-Unsubscribe when deciding Inbox vs Promotions vs
-             Spam for bulk mail from a personal address — without it these get filtered. */
           headers: {
             "List-Unsubscribe": `<mailto:${process.env.SMTP_USER || ""}?subject=unsubscribe>`,
           },
@@ -328,12 +412,7 @@ router.post("/email", async (req: Request, res: Response) => {
           messageId?: string;
         };
 
-        /* One recipient per send, so a non-throwing sendMail means Gmail
-           accepted the message. We still flag the rare case where the address
-           is explicitly refused in info.rejected (rather than throwing). The
-           earlier `accepted.length === 0` check was dropped — it could mark a
-           genuinely-sent mail as "failed" when Gmail returned no accepted list. */
-        const addr = (a: string | { address: string }) => (typeof a === "string" ? a : a.address);
+        const addr     = (a: string | { address: string }) => (typeof a === "string" ? a : a.address);
         const rejected = (info.rejected || []).map(addr).map((s) => s.toLowerCase());
 
         if (rejected.includes(to.toLowerCase())) {
@@ -353,13 +432,7 @@ router.post("/email", async (req: Request, res: Response) => {
       await sleep(400);
     }
 
-    res.json({
-      sent,
-      failed: failures.length,
-      skipped: skipped.length,
-      total: users.length,
-      failures,
-    });
+    res.json({ sent, failed: failures.length, skipped: skipped.length, total: users.length, failures });
   } catch (err) {
     console.error("Bulk email error:", err);
     res.status(500).json({ message: "Couldn't send the emails." });

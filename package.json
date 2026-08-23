@@ -36,6 +36,7 @@
     "nodemailer": "^9.0.3",
     "pdfkit": "^0.19.1",
     "sharp": "^0.34.5",
+    "socket.io": "^4.8.3",
     "tsx": "^4.22.4",
     "ua-parser-js": "^2.0.10"
   },

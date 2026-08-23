@@ -10,6 +10,10 @@ import "dotenv/config";
 import express, { type Request, type Response } from "express";
 import cors from "cors";
 import compression from "compression";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import path from "path";
+import { fileURLToPath } from "url";
 import { prisma } from "./config/prisma.js";
 import { verifyMailer } from "./config/mailer.js";
 import authRoutes from "./routes/authRoutes.js";
@@ -21,6 +25,10 @@ import userRoutes from "./routes/userRoutes.js";
 import inventoryRoutes from "./routes/inventoryRoutes.js";
 import invoiceRoutes from "./routes/invoiceRoutes.js";
 import securityRoutes from "./routes/securityRoutes.js";
+import taskRoutes from "./routes/taskRoutes.js";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname  = path.dirname(__filename);
 
 const app = express();
 
@@ -44,21 +52,59 @@ app.use(compression());
 app.use(express.json());
 app.set("trust proxy", true);
 
+// Serve uploaded task images (and any future uploads) as static files.
+// Files land at  backend/public/uploads/tasks/<filename>
+// and are served at  /uploads/tasks/<filename>  — same path taskRoutes writes.
+app.use(
+  "/uploads",
+  express.static(path.join(__dirname, "..", "public", "uploads")),
+);
+
+// ── Socket.IO setup ────────────────────────────────────────────────────────
+// Wrap Express in a raw HTTP server so Socket.IO can share the same port.
+const httpServer = createServer(app);
+
+const io = new Server(httpServer, {
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+  },
+});
+
+// Attach `io` to every request so route handlers can emit events without
+// importing the io instance directly (avoids circular imports).
+app.use((req: Request, _res, next) => {
+  (req as any).io = io;
+  next();
+});
+
+io.on("connection", (socket) => {
+  // Allow clients to join a personal room so admin can target a specific
+  // employee with task events instead of broadcasting to everyone.
+  socket.on("join", (userId: string) => {
+    if (typeof userId === "string" && userId.length > 0) {
+      socket.join(`user:${userId}`);
+    }
+  });
+});
+
+// ── Routes ─────────────────────────────────────────────────────────────────
 app.get("/", (_req: Request, res: Response) => res.send("Avijit Art API is running 🎨"));
-app.use("/api/auth", authRoutes);
-app.use("/api/services", serviceRoutes);
-app.use("/api/bookings", bookingRoutes);
-app.use("/api/posts", postRoutes);
+app.use("/api/auth",      authRoutes);
+app.use("/api/services",  serviceRoutes);
+app.use("/api/bookings",  bookingRoutes);
+app.use("/api/posts",     postRoutes);
 // Chatbot leads. New semantic path:
-app.use("/api/leads", leadRoutes);
+app.use("/api/leads",     leadRoutes);
 // Backward-compat alias so the existing ChatWidget (POST /api/visitors/lead)
 // keeps working with no frontend change. Remove this line once the ChatWidget
 // is switched over to /api/leads.
-app.use("/api/visitors", leadRoutes);
-app.use("/api/users", userRoutes);
+app.use("/api/visitors",  leadRoutes);
+app.use("/api/users",     userRoutes);
 app.use("/api/inventory", inventoryRoutes);
-app.use("/api/invoices", invoiceRoutes);
-app.use("/api/security", securityRoutes);
+app.use("/api/invoices",  invoiceRoutes);
+app.use("/api/security",  securityRoutes);
+app.use("/api/tasks",     taskRoutes);
 
 const PORT = process.env.PORT || 5000;
 
@@ -66,7 +112,8 @@ const PORT = process.env.PORT || 5000;
 prisma.$connect()
   .then(() => {
     console.log("✅ PostgreSQL (Neon) connected via Prisma");
-    app.listen(PORT, () => {
+    // Use httpServer (not app) so Socket.IO and Express share the same port.
+    httpServer.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       /* Check the SMTP login once at boot so a bad App Password shows up here
          instead of as a failed send later. Logs and returns, never throws —
