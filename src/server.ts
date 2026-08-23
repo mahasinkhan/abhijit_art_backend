@@ -1,5 +1,3 @@
-// backend/src/server.ts
-
 /* Load .env FIRST — this must stay the very first import.
    ESM evaluates every `import` before any module body code, so the old
    `import dotenv from "dotenv"; dotenv.config();` actually ran AFTER
@@ -11,13 +9,14 @@ import "dotenv/config";
 
 import express, { type Request, type Response } from "express";
 import cors from "cors";
+import compression from "compression";
 import { prisma } from "./config/prisma.js";
 import { verifyMailer } from "./config/mailer.js";
 import authRoutes from "./routes/authRoutes.js";
 import serviceRoutes from "./routes/serviceRoutes.js";
 import bookingRoutes from "./routes/bookingRoutes.js";
 import postRoutes from "./routes/postRoutes.js";
-import visitorRoutes from "./routes/visitorRoutes.js";
+import leadRoutes from "./routes/leadRoutes.js";
 import userRoutes from "./routes/userRoutes.js";
 import inventoryRoutes from "./routes/inventoryRoutes.js";
 import invoiceRoutes from "./routes/invoiceRoutes.js";
@@ -39,6 +38,9 @@ app.use(cors({
   credentials: true,
 }));
 
+// Compress all responses (gzip) — reduces payload size significantly
+app.use(compression());
+
 app.use(express.json());
 app.set("trust proxy", true);
 
@@ -47,7 +49,12 @@ app.use("/api/auth", authRoutes);
 app.use("/api/services", serviceRoutes);
 app.use("/api/bookings", bookingRoutes);
 app.use("/api/posts", postRoutes);
-app.use("/api/visitors", visitorRoutes);
+// Chatbot leads. New semantic path:
+app.use("/api/leads", leadRoutes);
+// Backward-compat alias so the existing ChatWidget (POST /api/visitors/lead)
+// keeps working with no frontend change. Remove this line once the ChatWidget
+// is switched over to /api/leads.
+app.use("/api/visitors", leadRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/inventory", inventoryRoutes);
 app.use("/api/invoices", invoiceRoutes);
