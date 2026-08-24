@@ -1,0 +1,2 @@
+-- AlterTable 
+ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "lessAmount" DECIMAL(12,2) NOT NULL DEFAULT 0; 

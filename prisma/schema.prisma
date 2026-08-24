@@ -103,6 +103,7 @@ model User {
   auditLogs      AuditLog[]
   tasksAssigned  Task[]          @relation("TasksAssigned")
   tasksCreated   Task[]          @relation("TasksCreated")
+  tasksDelivered Task[]          @relation("TasksDelivered")
   khataEntries   KhataEntry[]    @relation("KhataCreated")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
@@ -321,6 +322,13 @@ model Invoice {
   notes       String?
   warranty    String?
 
+  // ── CONCESSION / BARGAINING ──────────────────────────────────────────
+  // Amount the admin chose to concede during negotiation (e.g. ₹500 off on
+  // a ₹10 000 bill). Purely informational — NEVER changes total, subtotal,
+  // paidAmount or any other computed figure. Visible to admin only; never
+  // printed on the customer PDF or sent in email/WhatsApp.
+  lessAmount  Decimal  @default(0) @db.Decimal(12, 2)
+
   // payment-reminder tracking — when this client was last nudged about a
   // balance due + how many reminders have been sent (email or WhatsApp).
   lastRemindedAt DateTime?
@@ -383,6 +391,16 @@ model Task {
   startedAt   DateTime?
   completedAt DateTime?
 
+  // delivery — which staff member physically handed the finished order to the
+  // customer, and when. Set when a COMPLETED task is marked delivered by the
+  // assigned employee (or admin). This is what admin reads to see who
+  // delivered each order. SetNull keeps the record if that user is later
+  // removed. Moving the task back out of "completed" clears these fields
+  // (handled in the routes) — you can't have delivered an unfinished task.
+  deliveredAt   DateTime?
+  deliveredBy   User?    @relation("TasksDelivered", fields: [deliveredById], references: [id], onDelete: SetNull)
+  deliveredById String?
+
   // customer work-order details — this task is tied to a customer job.
   // Stored as a snapshot (like an invoice's client fields) so the order
   // always shows who it was for, even if the customer record changes.
@@ -410,6 +428,7 @@ model Task {
   @@index([assignedToId, status])
   @@index([status])
   @@index([createdAt])
+  @@index([deliveredById])
 }
 
 // ───────────────────────── SECURITY / AUDIT ─────────────────────────

@@ -31,6 +31,7 @@ const upload = multer({
 const taskInclude = {
   assignedTo: { select: { id: true, name: true, email: true } },
   createdBy: { select: { id: true, name: true } },
+  deliveredBy: { select: { id: true, name: true } },
 };
 
 // FormData sends everything as strings — coerce money fields safely to int ₹.
@@ -153,7 +154,10 @@ router.get("/mine", async (req: Request, res: Response) => {
   try {
     const tasks = await prisma.task.findMany({
       where: { assignedToId: req.user!.id },
-      include: { createdBy: { select: { id: true, name: true } } },
+      include: {
+        createdBy: { select: { id: true, name: true } },
+        deliveredBy: { select: { id: true, name: true } },
+      },
       orderBy: [{ status: "asc" }, { deadline: "asc" }, { createdAt: "desc" }],
     });
     res.json(tasks);
@@ -265,6 +269,9 @@ router.patch(
           ...(invoiceId !== undefined && { invoiceId: invoiceId?.trim() || null }),
           ...(invoiceNo !== undefined && { invoiceNo: invoiceNo?.trim() || null }),
           ...(assignedToId !== undefined && { assignedToId }),
+          // moving a task back out of "completed" un-delivers it — a task that
+          // isn't finished can't have been delivered.
+          ...(status !== undefined && status !== "completed" && { deliveredAt: null, deliveredById: null }),
           ...stamps,
           images,
           links: parsedLinks,
@@ -303,7 +310,47 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
 
     const updated = await prisma.task.update({
       where: { id: String(req.params.id) },
-      data: { status, ...(notes !== undefined && { notes }), ...stamps },
+      data: {
+        status,
+        ...(notes !== undefined && { notes }),
+        // leaving "completed" clears the delivery record (see PATCH /:id note)
+        ...(status !== "completed" && { deliveredAt: null, deliveredById: null }),
+        ...stamps,
+      },
+      include: taskInclude,
+    });
+
+    emitTaskUpdate(req, "task:updated", updated);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -- Employee (or admin): Mark a COMPLETED task delivered --------------------
+// Records who physically handed the order to the customer + when. Pass
+// { delivered: false } to undo an accidental mark. The assigned employee can
+// deliver their own task; admin can deliver any. A task must be completed
+// first (delivery is the step after completion).
+router.patch("/:id/deliver", async (req: Request, res: Response) => {
+  try {
+    const task = await prisma.task.findUnique({ where: { id: String(req.params.id) } });
+    if (!task) return res.status(404).json({ error: "Task not found" });
+    if (req.user!.role === "employee" && task.assignedToId !== req.user!.id) {
+      return res.status(403).json({ error: "Access denied" });
+    }
+
+    const undo = req.body?.delivered === false;
+
+    if (!undo && task.status !== "completed") {
+      return res.status(400).json({ error: "Mark the task completed before delivering it" });
+    }
+
+    const updated = await prisma.task.update({
+      where: { id: String(req.params.id) },
+      data: undo
+        ? { deliveredAt: null, deliveredById: null }
+        : { deliveredAt: new Date(), deliveredById: req.user!.id },
       include: taskInclude,
     });
 
