@@ -103,6 +103,7 @@ model User {
   auditLogs      AuditLog[]
   tasksAssigned  Task[]          @relation("TasksAssigned")
   tasksCreated   Task[]          @relation("TasksCreated")
+  khataEntries   KhataEntry[]    @relation("KhataCreated")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   address String?
@@ -440,4 +441,50 @@ model AuditLog {
   @@index([createdAt])
   @@index([entity, entityId])
   @@index([action])
+}
+
+// ─────────────────────────────── KHATA ───────────────────────────────
+
+// Daily ledger entry — quick cash-counter style order record.
+// Can be converted to a full Invoice later.
+enum KhataStatus {
+  unbilled   // quick entry, no invoice yet
+  billed     // converted to an Invoice
+}
+
+model KhataEntry {
+  id            String        @id @default(cuid())
+
+  // customer snapshot (same pattern as Invoice / Task)
+  customerId    String?       // link to User if they exist in DB
+  customerName  String
+  customerPhone String        @default("")
+  customerEmail String        @default("")
+
+  // what they ordered — same Json shape as Invoice.items
+  items         Json          // [{ desc, qty, rate }]
+  description   String        @default("")  // optional free-text note
+
+  // money
+  amount        Decimal       @db.Decimal(12, 2)  // total order value
+  advancePaid   Decimal       @default(0) @db.Decimal(12, 2)
+  paymentMethod PaymentMethod @default(cash)
+
+  // lifecycle
+  status        KhataStatus   @default(unbilled)
+  invoiceId     String?       // set when converted to invoice
+  invoiceNo     String?
+
+  // who created it
+  createdBy     User?         @relation("KhataCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById   String?
+
+  entryDate     DateTime      @default(now())
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  @@index([entryDate])
+  @@index([customerName])
+  @@index([status])
+  @@index([customerId])
 }

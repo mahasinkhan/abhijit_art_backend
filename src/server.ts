@@ -26,6 +26,7 @@ import inventoryRoutes from "./routes/inventoryRoutes.js";
 import invoiceRoutes from "./routes/invoiceRoutes.js";
 import securityRoutes from "./routes/securityRoutes.js";
 import taskRoutes from "./routes/taskRoutes.js";
+import khataRoutes from "./routes/khataRoutes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -105,6 +106,7 @@ app.use("/api/inventory", inventoryRoutes);
 app.use("/api/invoices",  invoiceRoutes);
 app.use("/api/security",  securityRoutes);
 app.use("/api/tasks",     taskRoutes);
+app.use("/api/khata",     khataRoutes);
 
 const PORT = process.env.PORT || 5000;
 

@@ -64,7 +64,7 @@ router.get("/", async (req: Request, res: Response) => {
     const q = str(req.query.q);
     const source = str(req.query.source).toLowerCase();
 
-    const where: Prisma.UserWhereInput = {};
+    const where: Prisma.UserWhereInput = { role: "client" };
     if (q) {
       where.OR = [
         { name: { contains: q, mode: "insensitive" } },
@@ -105,16 +105,21 @@ router.post("/", async (req: Request, res: Response) => {
     const notes = str(req.body.notes);
 
     if (!name) return res.status(400).json({ message: "Name is required." });
-    if (!email) return res.status(400).json({ message: "Email is required so you can send this customer offers." });
-    if (!isEmail(email)) return res.status(400).json({ message: "That email doesn't look right." });
+    // Email is optional for walk-in customers — synthesize a placeholder so the
+    // (unique, required) email column is satisfied. Real emails are validated.
+    const normP = phone.replace(/[\s\-()]/g, "").replace(/^\+91/, "").replace(/^0+/, "");
+    const finalEmail = email
+      ? (isEmail(email) ? email : "")
+      : `cust-${normP || crypto.randomBytes(5).toString("hex")}@noemail.abhijitart`;
+    if (email && !finalEmail) return res.status(400).json({ message: "That email doesn't look right." });
 
-    const clash = await prisma.user.findUnique({ where: { email } });
+    const clash = await prisma.user.findUnique({ where: { email: finalEmail } });
     if (clash) return res.status(409).json({ message: "A customer with this email already exists." });
 
     const user = await prisma.user.create({
       data: {
         name,
-        email,
+        email: finalEmail,
         phone: phone || undefined,
         address: address || null,
         notes: notes || null,
