@@ -105,6 +105,9 @@ model User {
   tasksCreated   Task[]          @relation("TasksCreated")
   tasksDelivered Task[]          @relation("TasksDelivered")
   khataEntries   KhataEntry[]    @relation("KhataCreated")
+  // supplier ledger — who recorded a purchase bill / a payment to a supplier
+  purchasesCreated SupplierPurchase[] @relation("PurchaseCreated")
+  supplierPayments SupplierPayment[]  @relation("SupplierPaymentCreated")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   address String?
@@ -190,6 +193,21 @@ model Supplier {
   active    Boolean         @default(true)
   items     InventoryItem[]
   movements StockMovement[]
+
+  // ── account ledger (accounts payable) ────────────────────────────────
+  // Cached rollups, kept in sync inside the SAME transaction as every
+  // purchase / payment. This is what makes the supplier list O(1): showing
+  // each vendor's outstanding balance never has to scan the purchase/payment
+  // ledger, so the list stays fast no matter how many years of bills pile up.
+  //   balance owed = totalPurchased − totalPaid   (derived on read)
+  totalPurchased Decimal   @default(0) @db.Decimal(14, 2) // Σ of purchase-bill totals
+  totalPaid      Decimal   @default(0) @db.Decimal(14, 2) // Σ of payments made
+  lastPurchaseAt DateTime?                                 // drives "last purchase" on the card
+
+  purchases  SupplierPurchase[]
+  payments   SupplierPayment[]
+  itemPrices ItemSupplier[]
+
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
 
@@ -226,7 +244,9 @@ model InventoryItem {
   supplierId String?
   supplier   Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
 
-  movements StockMovement[]
+  movements      StockMovement[]
+  purchaseLines  SupplierPurchaseItem[]
+  supplierPrices ItemSupplier[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -234,6 +254,36 @@ model InventoryItem {
   @@index([name])
   @@index([category])
   @@index([active])
+}
+
+// Per-supplier pricing for an item. The SAME item (e.g. "FLEX 220 GSM") can be
+// bought from several suppliers at DIFFERENT rates — one row here per
+// item↔supplier pair holds that supplier's quoted price, so the item can show
+// and compare all of them and flag a preferred/cheapest source. Recording a
+// purchase refreshes lastRate/lastPurchaseAt for the matching pair, giving a
+// per-supplier price history to reorder against.
+model ItemSupplier {
+  id         String        @id @default(cuid())
+  item       InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  itemId     String
+  supplier   Supplier      @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  supplierId String
+
+  price       Decimal @db.Decimal(12, 2) // this supplier's quoted rate for the item
+  supplierSku String  @default("")        // supplier's own code for it (optional)
+  preferred   Boolean @default(false)     // the go-to supplier for this item
+  note        String  @default("")
+
+  // auto-filled from the last actual purchase of this item from this supplier
+  lastRate       Decimal?  @db.Decimal(12, 2)
+  lastPurchaseAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([itemId, supplierId]) // one price row per item↔supplier pair
+  @@index([itemId])
+  @@index([supplierId])
 }
 
 model StockMovement {
@@ -263,9 +313,19 @@ model StockMovement {
   supplierId String?
   supplier   Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
 
+  // the purchase bill that created this stock-in row (null for a manual Move)
+  purchase   SupplierPurchase? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
+  purchaseId String?
+
   // which job consumed this stock — enables per-order costing
   booking   Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   bookingId String?
+
+  // the bill (invoice) that consumed this stock (consumption) or handed it
+  // back (returned, on cancel/delete). Set when auto-deducting on billing.
+  // SetNull so the ledger row survives if the invoice is later deleted.
+  invoice   Invoice? @relation("InvoiceStock", fields: [invoiceId], references: [id], onDelete: SetNull)
+  invoiceId String?
 
   // who recorded it — the audit trail
   user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
@@ -276,6 +336,93 @@ model StockMovement {
   @@index([itemId, createdAt])
   @@index([type])
   @@index([bookingId])
+  @@index([purchaseId])
+  @@index([invoiceId])
+}
+
+// A purchase bill / GRN from a supplier. The header carries the money (what
+// you owe for this bill); the lines carry which stock came in. Recording a
+// purchase writes one StockMovement per line (adding stock) AND bumps the
+// supplier's cached totalPurchased + lastPurchaseAt — all inside one
+// transaction, so stock, the bill and the account balance can never disagree.
+// This is the "middle" record that ties a supplier to their stock + the debt.
+model SupplierPurchase {
+  id         String   @id @default(cuid())
+  supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  supplierId String
+
+  billNo   String   @default("") // supplier's invoice / challan number (not unique)
+  billDate DateTime               // date printed on the bill (may differ from entry time)
+
+  // charges as entered on the bill
+  discType DiscountType @default(amount)
+  discVal  Decimal      @default(0) @db.Decimal(12, 2)
+  taxPct   Decimal      @default(0) @db.Decimal(5, 2)
+
+  // frozen totals, computed server-side. total is the debit added to the
+  // supplier account: subtotal − discountAmt + taxAmt.
+  subtotal    Decimal @db.Decimal(14, 2)
+  discountAmt Decimal @default(0) @db.Decimal(14, 2)
+  taxAmt      Decimal @default(0) @db.Decimal(14, 2)
+  total       Decimal @db.Decimal(14, 2)
+
+  notes String @default("")
+
+  items     SupplierPurchaseItem[]
+  movements StockMovement[] // the stock-in rows this bill created
+
+  createdBy   User?   @relation("PurchaseCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([supplierId, billDate])
+  @@index([billDate])
+  @@index([billNo])
+}
+
+// One line of a purchase bill: which item, how much, at what rate. name/unit
+// are snapshotted so the line still reads if the item is later renamed/deleted.
+model SupplierPurchaseItem {
+  id         String           @id @default(cuid())
+  purchase   SupplierPurchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  purchaseId String
+
+  item   InventoryItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
+  itemId String?
+  name   String                      // snapshot of the item name at purchase time
+  unit   StockUnit @default(piece)   // snapshot of the unit
+
+  quantity Decimal @db.Decimal(14, 3)
+  rate     Decimal @db.Decimal(12, 2)
+  amount   Decimal @db.Decimal(14, 2) // quantity × rate
+
+  createdAt DateTime @default(now())
+
+  @@index([purchaseId])
+  @@index([itemId])
+}
+
+// A payment MADE to a supplier — account-level (khata style), not tied to a
+// specific bill. Append-only; each row is cash or online. The supplier's
+// cached totalPaid is always the SUM of these. Deleting a row is a correction
+// (PIN-gated + audited). balance owed = totalPurchased − totalPaid.
+model SupplierPayment {
+  id         String        @id @default(cuid())
+  supplier   Supplier      @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  supplierId String
+  amount     Decimal       @db.Decimal(14, 2)
+  method     PaymentMethod @default(cash)
+  note       String        @default("") // optional ref, e.g. "UPI 4821" / "cheque 00123"
+  paidAt     DateTime      @default(now())
+
+  createdBy   User?   @relation("SupplierPaymentCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+
+  createdAt DateTime @default(now())
+
+  @@index([supplierId, paidAt])
 }
 
 // ───────────────────────── BILLING / INVOICES ─────────────────────────
@@ -298,7 +445,7 @@ model Invoice {
 
   // full snapshots so a saved bill re-renders exactly as it was issued
   business    Json     // { name, address, phone, email, gstin, pan }
-  items       Json     // [{ desc, qty, rate }]
+  items       Json     // [{ desc, qty, rate, itemId? }]  — itemId links a line to an InventoryItem for stock auto-deduct
 
   // charges as entered
   discType    DiscountType @default(amount)
@@ -328,6 +475,14 @@ model Invoice {
   // paidAmount or any other computed figure. Visible to admin only; never
   // printed on the customer PDF or sent in email/WhatsApp.
   lessAmount  Decimal  @default(0) @db.Decimal(12, 2)
+
+  // ── STOCK AUTO-DEDUCT ────────────────────────────────────────────────
+  // true once this bill's stock-linked line items have had their consumption
+  // movements written, so a re-save can never double-deduct. Cancel/delete
+  // reverses them (returned movements) and flips this back to false. The
+  // movements themselves link back here via StockMovement.invoiceId.
+  stockApplied   Boolean         @default(false)
+  stockMovements StockMovement[] @relation("InvoiceStock")
 
   // payment-reminder tracking — when this client was last nudged about a
   // balance due + how many reminders have been sent (email or WhatsApp).
@@ -445,7 +600,7 @@ model Setting {
 // is attributable to who + when + what. Never edited or deleted from the app.
 model AuditLog {
   id        String   @id @default(cuid())
-  action    String   // "invoice.create" | "invoice.payment" | "invoice.status" | "invoice.cancel" | "invoice.delete" | "invoice.edit" | "invoice.remind"
+  action    String   // "invoice.create" | "invoice.payment" | "invoice.status" | "invoice.cancel" | "invoice.delete" | "invoice.edit" | "invoice.remind" | "inventory.purchase.create" | "inventory.supplier.payment" | "inventory.supplier.payment.delete" | "inventory.item.price.set" | "inventory.item.price.delete"
   entity    String   @default("invoice")
   entityId  String?  // the affected record's id
   entityRef String   @default("") // human handle, e.g. the invoice number

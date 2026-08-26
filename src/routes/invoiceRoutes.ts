@@ -8,6 +8,7 @@ import { transporter, mailFrom, siteUrl } from "../config/mailer.js";
 import { buildInvoicePdf, pdfHasRupeeGlyph, invoiceLogoPath } from "../utils/invoicePdf.js";
 import { prisma } from "../config/prisma.js";
 import { isPinSet, verifyPin, logAudit } from "../utils/security.js";
+import { inventoryService, type InvoiceStockSync } from "../services/inventory.service.js";
 
 const router = Router();
 
@@ -35,13 +36,26 @@ const fmtDate = (d: string) => {
 };
 
 type Party = { name?: string; address?: string; phone?: string; email?: string; gstin?: string; pan?: string };
-type Line = { desc?: string; qty?: unknown; rate?: unknown };
+type Line = { desc?: string; qty?: unknown; rate?: unknown; itemId?: unknown };
 
 const asSource = (v: unknown, fallback: "online" | "offline"): "online" | "offline" =>
   v === "online" ? "online" : v === "offline" ? "offline" : fallback;
 
 const asMethod = (v: unknown, fallback: "cash" | "online"): "cash" | "online" =>
   v === "cash" ? "cash" : v === "online" ? "online" : fallback;
+
+/* normalise a line for storage — keeps an optional itemId (links the line to an
+   InventoryItem so billing can auto-deduct that stock). Lines with no itemId
+   are pure services and never touch inventory. Persisted on create AND edit so
+   the link survives a later cancel/delete restock. */
+const mapLine = (it: Line) => {
+  const line: { desc: string; qty: number; rate: number; itemId?: string } = {
+    desc: str(it.desc), qty: num(it.qty), rate: num(it.rate),
+  };
+  const itemId = str(it.itemId);
+  if (itemId) line.itemId = itemId;
+  return line;
+};
 
 function computeTotals(lines: Line[], discType: string | undefined, discValRaw: unknown, taxPctRaw: unknown) {
   const subtotal = lines.reduce((s, it) => s + num(it.qty) * num(it.rate), 0);
@@ -102,6 +116,41 @@ async function recomputeInvoice(invoiceId: string, opts: { reactivate?: boolean 
     where: { id: invoiceId },
     data: { paidAmount, status: status as "unpaid" | "partial" | "paid" | "cancelled" },
     include: withPayments,
+  });
+}
+
+/* ── stock auto-deduct (billing) — best-effort wrappers ──
+   A stock hiccup must NEVER fail or roll back the bill, so these swallow errors
+   and return the sync summary (or undefined). applyInvoiceStock/reverseInvoiceStock
+   are themselves idempotent (guarded by invoice.stockApplied). */
+async function applyStockSafely(invoiceId: string, userId: string | null): Promise<InvoiceStockSync | undefined> {
+  try {
+    return await inventoryService.applyInvoiceStock(invoiceId, userId);
+  } catch (e) {
+    console.error("Invoice stock deduct failed:", (e as Error).message);
+    return undefined;
+  }
+}
+async function reverseStockSafely(invoiceId: string, reason: string, userId: string | null): Promise<InvoiceStockSync | undefined> {
+  try {
+    return await inventoryService.reverseInvoiceStock(invoiceId, reason, userId);
+  } catch (e) {
+    console.error("Invoice stock restock failed:", (e as Error).message);
+    return undefined;
+  }
+}
+async function logStockAudit(req: Request, kind: "deduct" | "restock", invoiceNo: string, invoiceId: string, stock?: InvoiceStockSync) {
+  if (!stock?.changed) return;
+  const low = stock.warnings.length;
+  await logAudit({
+    req,
+    action: kind === "deduct" ? "invoice.stock.deduct" : "invoice.stock.restock",
+    entityId: invoiceId,
+    entityRef: invoiceNo,
+    summary: kind === "deduct"
+      ? `Stock deducted for ${invoiceNo} — ${stock.movementCount} item(s)${low ? `, ${low} now low/out` : ""}`
+      : `Stock returned for ${invoiceNo} — ${stock.movementCount} item(s)`,
+    detail: { items: stock.items, warnings: stock.warnings },
   });
 }
 
@@ -475,7 +524,7 @@ router.post("/", async (req: Request, res: Response) => {
         name: str(biz.name), address: str(biz.address), phone: str(biz.phone),
         email: str(biz.email), gstin: str(biz.gstin), pan: str(biz.pan),
       },
-      items: lines.map((it) => ({ desc: str(it.desc), qty: num(it.qty), rate: num(it.rate) })),
+      items: lines.map(mapLine),
       discType: (inv.discType === "percent" ? "percent" : "amount") as "amount" | "percent",
       discVal, taxPct, subtotal, discountAmt, taxAmt, total,
       notes: str(inv.notes) || null,
@@ -483,6 +532,8 @@ router.post("/", async (req: Request, res: Response) => {
     };
 
     if (existing) {
+      // re-save of an existing bill — NEVER re-runs stock (only create consumes;
+      // editing linked lines is a separate, phase-2 concern).
       await prisma.invoice.update({ where: { invoiceNo }, data: content });
       const synced = await recomputeInvoice(existing.id, { reactivate: false });
       return res.status(200).json(synced);
@@ -505,14 +556,20 @@ router.post("/", async (req: Request, res: Response) => {
 
     const synced = await recomputeInvoice(created.id, { reactivate: false });
 
+    // auto-deduct stock for any line linked to an inventory item (best-effort —
+    // never fails the bill). Negatives allowed; now-out/low items come back as
+    // warnings for the Billing tab to surface.
+    const stock = await applyStockSafely(created.id, createdById);
+
     await logAudit({
       req, action: "invoice.create", entityId: created.id, entityRef: invoiceNo,
       summary: `Created invoice ${invoiceNo} for ${content.clientName} — ${rupee(total)}` +
         (advance > 0 ? ` (advance ${rupee(advance)} ${asMethod(inv.paymentMethod, "cash")})` : ""),
       detail: { total, advance, method: advance > 0 ? asMethod(inv.paymentMethod, "cash") : null },
     });
+    await logStockAudit(req, "deduct", invoiceNo, created.id, stock);
 
-    res.status(201).json(synced);
+    res.status(201).json({ ...synced, stock });
   } catch (err) {
     console.error("Invoice save failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't save the invoice." });
@@ -707,7 +764,9 @@ router.patch("/:id/edit", async (req: Request, res: Response) => {
         clientEmail: str(client.email) || null,
         clientGstin: str(client.gstin) || null,
         clientAddr: str(client.address) || null,
-        items: lines.map((it) => ({ desc: str(it.desc), qty: num(it.qty), rate: num(it.rate) })),
+        // itemId preserved so a later cancel/delete restock still sees the links
+        // (stock is NOT re-synced on edit yet — phase 2).
+        items: lines.map(mapLine),
         discType: (body.discType === "percent" ? "percent" : "amount") as "amount" | "percent",
         discVal, taxPct, subtotal, discountAmt, taxAmt, total,
         notes: str(body.notes) || null,
@@ -754,6 +813,7 @@ router.post("/:id/payments", async (req: Request, res: Response) => {
     const method = asMethod(req.body.method, "cash");
     const note = str(req.body.note);
     const createdById = (req as any).user?.id ?? null;
+    const wasCancelled = invoice.status === "cancelled";
 
     await prisma.payment.create({
       data: { invoiceId: id, amount, method, note: note || "", createdById },
@@ -762,13 +822,19 @@ router.post("/:id/payments", async (req: Request, res: Response) => {
     const updated = await recomputeInvoice(id, { reactivate: true });
     const balance = updated ? round2(Math.max(total - Number(updated.paidAmount), 0)) : 0;
 
+    // a payment un-cancels the bill → re-consume its linked stock
+    const stock = wasCancelled && updated && updated.status !== "cancelled"
+      ? await applyStockSafely(id, createdById)
+      : undefined;
+
     await logAudit({
       req, action: "invoice.payment", entityId: invoice.id, entityRef: invoice.invoiceNo,
       summary: `Payment on ${invoice.invoiceNo}: ${rupee(amount)} ${method} (balance ${rupee(balance)})`,
       detail: { amount, method, note, balanceDue: balance, status: updated?.status },
     });
+    await logStockAudit(req, "deduct", invoice.invoiceNo, invoice.id, stock);
 
-    res.status(201).json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null });
+    res.status(201).json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null, stock });
   } catch (err) {
     if ((err as { code?: string }).code === "P2025") return res.status(404).json({ message: "Invoice not found." });
     console.error("Invoice payment failed:", err);
@@ -817,18 +883,28 @@ router.patch("/:id/status", async (req: Request, res: Response) => {
     if (pe) return res.status(pe.code).json({ message: pe.message });
 
     const id = str(req.params.id);
+    const actorId = (req as any).user?.id ?? null;
     const invoice = await prisma.invoice.findUnique({ where: { id } });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
 
     if (status === "cancelled") {
       const updated = await prisma.invoice.update({ where: { id }, data: { status: "cancelled" }, include: withPayments });
+      // cancelling restocks any linked items
+      const stock = await reverseStockSafely(id, "cancelled", actorId);
       await logAudit({ req, action: "invoice.cancel", entityId: invoice.id, entityRef: invoice.invoiceNo, summary: `Cancelled invoice ${invoice.invoiceNo}`, detail: { from: invoice.status, to: "cancelled" } });
-      return res.json({ ...updated, pdfUrl: invoicePdfUrl(req, updated.id) });
+      await logStockAudit(req, "restock", invoice.invoiceNo, invoice.id, stock);
+      return res.json({ ...updated, pdfUrl: invoicePdfUrl(req, updated.id), stock });
     }
 
+    const wasCancelled = invoice.status === "cancelled";
     const updated = await recomputeInvoice(id, { reactivate: true });
+    // reactivating a cancelled bill → re-consume its linked stock
+    const stock = wasCancelled && updated && updated.status !== "cancelled"
+      ? await applyStockSafely(id, actorId)
+      : undefined;
     await logAudit({ req, action: "invoice.status", entityId: invoice.id, entityRef: invoice.invoiceNo, summary: `Reactivated invoice ${invoice.invoiceNo} → ${updated?.status}`, detail: { from: invoice.status, to: updated?.status } });
-    res.json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null });
+    await logStockAudit(req, "deduct", invoice.invoiceNo, invoice.id, stock);
+    res.json({ ...updated, pdfUrl: updated ? invoicePdfUrl(req, updated.id) : null, stock });
   } catch (err) {
     if ((err as { code?: string }).code === "P2025") return res.status(404).json({ message: "Invoice not found." });
     console.error("Invoice status update failed:", err);
@@ -843,8 +919,14 @@ router.delete("/:id", async (req: Request, res: Response) => {
     if (pe) return res.status(pe.code).json({ message: pe.message });
 
     const id = str(req.params.id);
+    const actorId = (req as any).user?.id ?? null;
     const invoice = await prisma.invoice.findUnique({ where: { id } });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
+
+    // restock linked items BEFORE removing the bill (writes returned movements
+    // while the invoice still exists; the FK then nulls invoiceId on delete,
+    // with the invoice number kept in each movement's note). Best-effort.
+    const stock = await reverseStockSafely(id, "deleted", actorId);
 
     await prisma.invoice.delete({ where: { id } });
 
@@ -853,8 +935,9 @@ router.delete("/:id", async (req: Request, res: Response) => {
       summary: `Deleted invoice ${invoice.invoiceNo} (${invoice.clientName}, ${rupee(Number(invoice.total))})`,
       detail: { total: Number(invoice.total), paidAmount: Number(invoice.paidAmount), status: invoice.status },
     });
+    await logStockAudit(req, "restock", invoice.invoiceNo, invoice.id, stock);
 
-    res.json({ ok: true });
+    res.json({ ok: true, stock });
   } catch (err) {
     if ((err as { code?: string }).code === "P2025") return res.status(404).json({ message: "Invoice not found." });
     console.error("Invoice delete failed:", err);
