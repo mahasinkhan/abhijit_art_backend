@@ -1,24 +1,8 @@
 // backend/src/services/inventory.service.ts
-/**
- * Inventory service layer.
- *
- * All inventory business logic + Prisma access lives here as plain async
- * functions. No Express: no req, no res. Failures `throw ApiError`; the route's
- * asyncHandler forwards those to the central errorHandler. Write operations
- * return `{ result, audit }` — `result` is the response payload, `audit` is a
- * descriptor the controller feeds to logAudit (which needs the request for the
- * actor/ip). This keeps the service pure and unit-testable while the audit
- * trail still gets the request context it needs.
- *
- * Read shapes match the previous route responses exactly (some pre-coerced to
- * numbers, some raw Prisma that the frontend api layer coerces), so swapping
- * the routes over to this service is behaviour-preserving.
- */
 import type { Prisma, MovementType } from "@prisma/client";
 import { prisma } from "../config/prisma.js";
 import { ApiError } from "../middleware/error.js";
 
-/* audit descriptor a write returns for the controller to log */
 export interface AuditInfo {
   action: string;
   entityId?: string;
@@ -31,7 +15,6 @@ interface Write<T> {
   audit: AuditInfo;
 }
 
-/* ── input shapes (what the controller hands in from req.body / req.query) ── */
 export interface ItemsFilter { q?: string; category?: string; low?: boolean; active?: boolean; }
 export interface CreateItemBody {
   sku?: string; name?: string; description?: string; category?: string; unit?: string;
@@ -52,20 +35,17 @@ export interface PurchaseBody {
   discType?: string; discVal?: unknown; taxPct?: unknown; notes?: string; items?: unknown[];
 }
 
-/* ── invoice → stock auto-deduct (billing) ── */
 export interface StockWarning {
   id: string; name: string; sku: string; unit: string; quantity: number;
-  kind: "out" | "low"; // now ≤ 0, or ≤ reorderLevel
+  kind: "out" | "low";
 }
 export interface InvoiceStockSync {
-  changed: boolean;            // did THIS call write any stock movements?
+  changed: boolean;
   movementCount: number;
   items: { id: string; name: string; sku: string; unit: string; quantity: number }[];
-  warnings: StockWarning[];    // items out (≤0) / low (≤reorder) after deducting
+  warnings: StockWarning[];
 }
 interface AffectedItem { id: string; name: string; sku: string; unit: string; quantity: number; reorderLevel: number; }
-
-/* ═══════════════════════ constants & pure helpers ═══════════════════════ */
 
 const userPublic = { select: { name: true, email: true } };
 
@@ -78,7 +58,6 @@ const MOVE_LABEL: Record<string, string> = {
 };
 const STOCK_UNITS = ["piece", "sqft", "metre", "roll", "sheet", "litre", "kg", "box", "set"];
 
-/* Neon-safe interactive-transaction budget (network hop per statement). */
 const TX_OPTS = { maxWait: 15_000, timeout: 30_000 } as const;
 
 const toNum = (v: unknown): number | null => {
@@ -89,8 +68,6 @@ const toNum = (v: unknown): number | null => {
 const round2 = (x: number) => Math.round((x + Number.EPSILON) * 100) / 100;
 const round3 = (x: number) => Math.round((x + Number.EPSILON) * 1000) / 1000;
 
-/* one shape for a supplier everywhere it leaves this service: Decimals coerced
-   + the derived balance owed (read straight off cached rollups → O(1)) */
 const supplierView = <T extends { totalPurchased: unknown; totalPaid: unknown }>(sp: T) => ({
   ...sp,
   totalPurchased: Number(sp.totalPurchased),
@@ -98,7 +75,6 @@ const supplierView = <T extends { totalPurchased: unknown; totalPaid: unknown }>
   balance: round2(Number(sp.totalPurchased) - Number(sp.totalPaid)),
 });
 
-/* ── date/bucket helpers for the dashboard ── */
 type Gran = "day" | "week" | "month" | "year";
 const asGran = (v: unknown): Gran => {
   const g = String(v || "").toLowerCase();
@@ -108,28 +84,25 @@ const asGran = (v: unknown): Gran => {
   return "month";
 };
 const pad = (n: number) => String(n).padStart(2, "0");
-const startOfDay = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
-const startOfWeek = (d: Date) => {
-  const dow = (d.getDay() + 6) % 7;
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow);
-};
+const startOfDay   = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate());
+const startOfWeek  = (d: Date) => { const dow = (d.getDay() + 6) % 7; return new Date(d.getFullYear(), d.getMonth(), d.getDate() - dow); };
 const startOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1);
-const startOfYear = (d: Date) => new Date(d.getFullYear(), 0, 1);
-const bucketStart = (d: Date, g: Gran) =>
+const startOfYear  = (d: Date) => new Date(d.getFullYear(), 0, 1);
+const bucketStart  = (d: Date, g: Gran) =>
   g === "day" ? startOfDay(d) : g === "week" ? startOfWeek(d) : g === "month" ? startOfMonth(d) : startOfYear(d);
 const nextBucket = (d: Date, g: Gran) =>
-  g === "day" ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)
-  : g === "week" ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + 7)
+  g === "day"   ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1)
+  : g === "week"  ? new Date(d.getFullYear(), d.getMonth(), d.getDate() + 7)
   : g === "month" ? new Date(d.getFullYear(), d.getMonth() + 1, 1)
   : new Date(d.getFullYear() + 1, 0, 1);
 const bucketKey = (d: Date, g: Gran) => {
   const b = bucketStart(d, g);
-  if (g === "year") return `${b.getFullYear()}`;
+  if (g === "year")  return `${b.getFullYear()}`;
   if (g === "month") return `${b.getFullYear()}-${pad(b.getMonth() + 1)}`;
   return `${b.getFullYear()}-${pad(b.getMonth() + 1)}-${pad(b.getDate())}`;
 };
 const bucketLabel = (b: Date, g: Gran) =>
-  g === "year" ? `${b.getFullYear()}`
+  g === "year"  ? `${b.getFullYear()}`
   : g === "month" ? b.toLocaleDateString("en-IN", { month: "short" })
   : b.toLocaleDateString("en-IN", { day: "numeric", month: "short" });
 const parseDate = (v: unknown): Date | null => {
@@ -140,21 +113,12 @@ const parseDate = (v: unknown): Date | null => {
 };
 const defaultRange = (g: Gran, now: Date): { from: Date; to: Date } => {
   const to = startOfDay(now);
-  if (g === "day") return { from: new Date(to.getFullYear(), to.getMonth(), to.getDate() - 13), to };
-  if (g === "week") {
-    const ws = startOfWeek(now);
-    return { from: new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() - 7 * 11), to };
-  }
+  if (g === "day")  return { from: new Date(to.getFullYear(), to.getMonth(), to.getDate() - 13), to };
+  if (g === "week") { const ws = startOfWeek(now); return { from: new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() - 7 * 11), to }; }
   if (g === "year") return { from: new Date(now.getFullYear() - 4, 0, 1), to };
   return { from: new Date(now.getFullYear(), now.getMonth() - 5, 1), to };
 };
 
-/* ── invoice stock-sync helpers ── */
-
-/* Aggregate an invoice's stock-linked lines (items[].itemId) → total qty per
-   item. Lines with no itemId are pure services and never touch stock. Two lines
-   pointing at the same item collapse into one movement. Drives APPLY (consume
-   per what the bill currently says). */
 const linkedLineTotals = (itemsJson: unknown): Map<string, number> => {
   const out = new Map<string, number>();
   const arr = Array.isArray(itemsJson) ? itemsJson : [];
@@ -170,9 +134,6 @@ const linkedLineTotals = (itemsJson: unknown): Map<string, number> => {
 
 const emptyStockSync = (): InvoiceStockSync => ({ changed: false, movementCount: 0, items: [], warnings: [] });
 
-/* Response summary + low/out warnings from the touched items. Warnings only
-   make sense after a deduction, so callers pass flagLow=true when consuming
-   and false when restocking. */
 const summarizeStockSync = (affected: AffectedItem[], flagLow: boolean): InvoiceStockSync => {
   const warnings: StockWarning[] = [];
   if (flagLow) {
@@ -189,15 +150,11 @@ const summarizeStockSync = (affected: AffectedItem[], flagLow: boolean): Invoice
   };
 };
 
-/* ═══════════════════════════════ the service ═══════════════════════════════ */
-
 export const inventoryService = {
-  /* ─────────────────────────── ITEMS ─────────────────────────── */
 
   async listItems(filter: ItemsFilter) {
     const q = (filter.q || "").trim();
     const category = (filter.category || "").trim();
-
     const where: Prisma.InventoryItemWhereInput = {};
     if (q) {
       where.OR = [
@@ -207,7 +164,7 @@ export const inventoryService = {
       ];
     }
     if (category) where.category = { equals: category, mode: "insensitive" };
-    if (filter.active === true) where.active = true;
+    if (filter.active === true)  where.active = true;
     if (filter.active === false) where.active = false;
 
     const items = await prisma.inventoryItem.findMany({
@@ -218,7 +175,6 @@ export const inventoryService = {
       },
       orderBy: { name: "asc" },
     });
-
     const withFlags = items.map((it) => ({ ...it, low: Number(it.quantity) <= Number(it.reorderLevel) }));
     return filter.low ? withFlags.filter((i) => i.low) : withFlags;
   },
@@ -247,7 +203,7 @@ export const inventoryService = {
   },
 
   async createItem(body: CreateItemBody, userId: string): Promise<Write<unknown>> {
-    if (!String(body.sku || "").trim()) throw ApiError.badRequest("SKU is required.");
+    if (!String(body.sku  || "").trim()) throw ApiError.badRequest("SKU is required.");
     if (!String(body.name || "").trim()) throw ApiError.badRequest("Name is required.");
 
     const unitVal = STOCK_UNITS.includes(String(body.unit)) ? String(body.unit) : "piece";
@@ -256,51 +212,95 @@ export const inventoryService = {
     if (clash) throw ApiError.conflict("An item with this SKU already exists.");
 
     const opening = toNum(body.openingQty) ?? 0;
-    const cost = toNum(body.costPrice) ?? 0;
+    const cost    = toNum(body.costPrice)   ?? 0;
 
     const item = await prisma.$transaction(async (tx) => {
       const created = await tx.inventoryItem.create({
         data: {
-          sku: String(body.sku).trim(),
-          name: String(body.name).trim(),
-          description: body.description || "",
-          category: (body.category || "").trim(),
-          unit: unitVal as any,
-          quantity: opening,
+          sku:          String(body.sku).trim(),
+          name:         String(body.name).trim(),
+          description:  body.description || "",
+          category:     (body.category || "").trim(),
+          unit:         unitVal as any,
+          quantity:     opening,
           reorderLevel: toNum(body.reorderLevel) ?? 0,
-          costPrice: cost,
-          sellPrice: toNum(body.sellPrice),
-          location: body.location || "",
-          imageUrl: body.imageUrl || "",
-          supplierId: body.supplierId || null,
+          costPrice:    cost,
+          sellPrice:    toNum(body.sellPrice),
+          location:     body.location  || "",
+          imageUrl:     body.imageUrl  || "",
+          supplierId:   body.supplierId || null,
         },
       });
 
       if (opening > 0) {
+        // Use "purchase" movement when supplier is set, "opening" otherwise
+        const movType = (body.supplierId ? "purchase" : "opening") as MovementType;
+
         await tx.stockMovement.create({
           data: {
-            itemId: created.id,
-            type: "opening",
-            quantity: opening,
-            delta: opening,
-            balance: opening,
-            unitCost: cost || null,
-            note: "Opening balance",
+            itemId:    created.id,
+            type:      movType,
+            quantity:  opening,
+            delta:     opening,
+            balance:   opening,
+            unitCost:  cost || null,
+            note:      body.supplierId ? "Initial purchase" : "Opening balance",
+            supplierId: body.supplierId || null,
             userId,
           },
         });
+
+        // Create a proper SupplierPurchase record so it appears in the supplier statement
+        if (body.supplierId && cost > 0) {
+          const purchaseTotal = round2(opening * cost);
+
+          const purchase = await tx.supplierPurchase.create({
+            data: {
+              supplierId:   body.supplierId,
+              billNo:       "",
+              billDate:     new Date(),
+              discType:     "amount" as any,
+              discVal:      0,
+              taxPct:       0,
+              subtotal:     purchaseTotal,
+              discountAmt:  0,
+              taxAmt:       0,
+              total:        purchaseTotal,
+              notes:        "Initial stock purchase",
+              createdById:  userId,
+            },
+          });
+
+          await tx.supplierPurchaseItem.create({
+            data: {
+              purchaseId: purchase.id,
+              itemId:     created.id,
+              name:       created.name,
+              unit:       created.unit,
+              quantity:   opening,
+              rate:       cost,
+              amount:     purchaseTotal,
+            },
+          });
+
+          await tx.supplier.update({
+            where: { id: body.supplierId },
+            data:  { totalPurchased: { increment: purchaseTotal }, lastPurchaseAt: new Date() },
+          });
+        }
       }
+
       return created;
     }, TX_OPTS);
 
     return {
       result: item,
       audit: {
-        action: "inventory.item.create",
-        entityId: item.id,
+        action:    "inventory.item.create",
+        entityId:  item.id,
         entityRef: item.sku,
-        summary: `Added item ${item.name} (${item.sku})${opening > 0 ? ` · opening ${opening} ${item.unit}` : ""}`,
-        detail: { sku: item.sku, name: item.name, opening, costPrice: cost },
+        summary:   `Added item ${item.name} (${item.sku})${opening > 0 ? ` · opening ${opening} ${item.unit}` : ""}`,
+        detail:    { sku: item.sku, name: item.name, opening, costPrice: cost },
       },
     };
   },
@@ -315,31 +315,25 @@ export const inventoryService = {
     }
 
     const data: Prisma.InventoryItemUpdateInput = {};
-    if (body.sku !== undefined) data.sku = String(body.sku).trim();
-    if (body.name !== undefined) data.name = String(body.name).trim();
+    if (body.sku         !== undefined) data.sku         = String(body.sku).trim();
+    if (body.name        !== undefined) data.name        = String(body.name).trim();
     if (body.description !== undefined) data.description = body.description || "";
-    if (body.category !== undefined) data.category = (body.category || "").trim();
+    if (body.category    !== undefined) data.category    = (body.category || "").trim();
     if (body.unit !== undefined && STOCK_UNITS.includes(String(body.unit))) data.unit = String(body.unit) as any;
     if (body.reorderLevel !== undefined) data.reorderLevel = toNum(body.reorderLevel) ?? 0;
-    if (body.costPrice !== undefined) data.costPrice = toNum(body.costPrice) ?? 0;
-    if (body.sellPrice !== undefined) data.sellPrice = toNum(body.sellPrice);
-    if (body.location !== undefined) data.location = body.location || "";
-    if (body.imageUrl !== undefined) data.imageUrl = body.imageUrl || "";
-    if (body.active !== undefined) data.active = !!body.active;
-    if (body.supplierId !== undefined) {
+    if (body.costPrice    !== undefined) data.costPrice    = toNum(body.costPrice)    ?? 0;
+    if (body.sellPrice    !== undefined) data.sellPrice    = toNum(body.sellPrice);
+    if (body.location     !== undefined) data.location     = body.location || "";
+    if (body.imageUrl     !== undefined) data.imageUrl     = body.imageUrl || "";
+    if (body.active       !== undefined) data.active       = !!body.active;
+    if (body.supplierId   !== undefined) {
       data.supplier = body.supplierId ? { connect: { id: body.supplierId } } : { disconnect: true };
     }
 
     const item = await prisma.inventoryItem.update({ where: { id }, data });
-
     return {
       result: item,
-      audit: {
-        action: "inventory.item.update",
-        entityId: item.id,
-        entityRef: item.sku,
-        summary: `Edited item ${item.name} (${item.sku})`,
-      },
+      audit: { action: "inventory.item.update", entityId: item.id, entityRef: item.sku, summary: `Edited item ${item.name} (${item.sku})` },
     };
   },
 
@@ -347,19 +341,12 @@ export const inventoryService = {
     const existing = await prisma.inventoryItem.findUnique({ where: { id } });
     if (!existing) throw ApiError.notFound("Item not found.");
     await prisma.inventoryItem.delete({ where: { id } });
-
     return {
       result: { ok: true },
-      audit: {
-        action: "inventory.item.delete",
-        entityId: existing.id,
-        entityRef: existing.sku,
-        summary: `Deleted item ${existing.name} (${existing.sku})`,
-      },
+      audit: { action: "inventory.item.delete", entityId: existing.id, entityRef: existing.sku, summary: `Deleted item ${existing.name} (${existing.sku})` },
     };
   },
 
-  /* the ONE single-item quantity-changing operation */
   async moveStock(itemId: string, body: MoveBody, userId: string): Promise<Write<unknown>> {
     const type = String(body.type || "").toLowerCase() as MovementType;
     if (!MOVEMENT_TYPES.includes(type as any)) throw ApiError.badRequest("Invalid movement type.");
@@ -368,10 +355,10 @@ export const inventoryService = {
     if (!item) throw ApiError.notFound("Item not found.");
 
     const current = Number(item.quantity);
-
     let delta: number;
+
     if (type === "adjustment") {
-      const dRaw = toNum(body.delta);
+      const dRaw   = toNum(body.delta);
       const target = toNum(body.newQuantity);
       if (dRaw !== null) delta = dRaw;
       else if (target !== null) delta = target - current;
@@ -380,7 +367,7 @@ export const inventoryService = {
     } else {
       const qty = toNum(body.quantity);
       if (qty === null || qty <= 0) throw ApiError.badRequest("Quantity must be a positive number.");
-      if (ADDS.has(type)) delta = qty;
+      if (ADDS.has(type))      delta =  qty;
       else if (SUBTRACTS.has(type)) delta = -qty;
       else delta = qty;
     }
@@ -406,26 +393,25 @@ export const inventoryService = {
         data: {
           itemId,
           type,
-          quantity: Math.abs(delta),
+          quantity:  Math.abs(delta),
           delta,
-          balance: newBalance,
-          unitCost: type === "purchase" ? cost : null,
+          balance:   newBalance,
+          unitCost:  type === "purchase" ? cost : null,
           reference: body.reference || "",
-          note: body.note || "",
+          note:      body.note      || "",
           supplierId: body.supplierId || null,
-          bookingId: body.bookingId || null,
+          bookingId:  body.bookingId  || null,
           userId,
         },
       });
       return { item: updated, movementId: created.id };
     }, TX_OPTS);
 
-    // hydrate the ledger row AFTER the commit (durable already; a slow join can't roll back)
     const movement = await prisma.stockMovement.findUnique({
       where: { id: result.movementId },
       include: {
         supplier: { select: { name: true } },
-        user: userPublic,
+        user:    userPublic,
         booking: { select: { id: true, serviceName: true } },
       },
     });
@@ -433,11 +419,11 @@ export const inventoryService = {
     return {
       result: { item: result.item, movement },
       audit: {
-        action: "inventory.move",
-        entityId: itemId,
+        action:    "inventory.move",
+        entityId:  itemId,
         entityRef: item.sku,
-        summary: `${MOVE_LABEL[type] || type} ${Math.abs(delta)} ${item.unit} · ${item.name} → balance ${newBalance} ${item.unit}`,
-        detail: { type, delta, newBalance, unitCost: cost, reference: body.reference || "", supplierId: body.supplierId || null },
+        summary:   `${MOVE_LABEL[type] || type} ${Math.abs(delta)} ${item.unit} · ${item.name} → balance ${newBalance} ${item.unit}`,
+        detail:    { type, delta, newBalance, unitCost: cost, reference: body.reference || "", supplierId: body.supplierId || null },
       },
     };
   },
@@ -447,7 +433,6 @@ export const inventoryService = {
       where: { active: true },
       select: { quantity: true, reorderLevel: true, costPrice: true },
     });
-
     let stockValue = 0, lowCount = 0, outCount = 0;
     for (const it of items) {
       const qty = Number(it.quantity);
@@ -474,22 +459,21 @@ export const inventoryService = {
       take,
       orderBy: { createdAt: "desc" },
       include: {
-        item: { select: { id: true, name: true, sku: true, unit: true } },
+        item:    { select: { id: true, name: true, sku: true, unit: true } },
         supplier: { select: { name: true } },
-        user: userPublic,
+        user:    userPublic,
         booking: { select: { id: true, serviceName: true } },
       },
     });
   },
 
-  /* period-filtered overview dashboard (see InventoryDashboard.tsx) */
   async dashboard(filter: DashboardFilter) {
-    const now = new Date();
+    const now  = new Date();
     const gran = asGran(filter.granularity);
-    const def = defaultRange(gran, now);
+    const def  = defaultRange(gran, now);
 
-    let from = bucketStart(parseDate(filter.from) ?? def.from, gran);
-    let toBucket = bucketStart(parseDate(filter.to) ?? def.to, gran);
+    let from     = bucketStart(parseDate(filter.from) ?? def.from, gran);
+    let toBucket = bucketStart(parseDate(filter.to)   ?? def.to,   gran);
     if (toBucket < from) { const t = from; from = toBucket; toBucket = t; }
     const rangeEnd = nextBucket(toBucket, gran);
 
@@ -509,16 +493,16 @@ export const inventoryService = {
     const catMap = new Map<string, { value: number; count: number }>();
 
     const valued = items.map((it) => {
-      const qty = Number(it.quantity);
-      const cost = Number(it.costPrice);
+      const qty    = Number(it.quantity);
+      const cost   = Number(it.costPrice);
       const reorder = Number(it.reorderLevel);
-      const value = qty * cost;
-      const out = qty <= 0;
+      const value  = qty * cost;
+      const out    = qty <= 0;
       stockValue += value;
       if (out) outCount += 1;
       else if (qty <= reorder) lowCount += 1;
       const cat = (it.category || "").trim() || "Uncategorised";
-      const c = catMap.get(cat) || { value: 0, count: 0 };
+      const c   = catMap.get(cat) || { value: 0, count: 0 };
       c.value += value; c.count += 1;
       catMap.set(cat, c);
       return { ...it, qty, cost, reorder, value, out };
@@ -551,13 +535,13 @@ export const inventoryService = {
     let purchaseValue = 0, consumptionValue = 0, wastageValue = 0;
 
     for (const m of periodMoves) {
-      const qty = Number(m.quantity);
-      const unit = m.unitCost != null ? Number(m.unitCost) : Number(m.item?.costPrice ?? 0);
+      const qty   = Number(m.quantity);
+      const unit  = m.unitCost != null ? Number(m.unitCost) : Number(m.item?.costPrice ?? 0);
       const value = qty * unit;
-      const b = trendMap.get(bucketKey(m.createdAt, gran));
-      if (m.type === "purchase") { purchaseValue += value; if (b) b.purchase += value; }
+      const b     = trendMap.get(bucketKey(m.createdAt, gran));
+      if (m.type === "purchase")    { purchaseValue    += value; if (b) b.purchase    += value; }
       else if (m.type === "consumption") { consumptionValue += value; if (b) b.consumption += value; }
-      else if (m.type === "wastage") { wastageValue += value; if (b) b.wastage += value; }
+      else if (m.type === "wastage")     { wastageValue     += value; if (b) b.wastage     += value; }
     }
 
     const trend = buckets.map((b) => {
@@ -569,9 +553,9 @@ export const inventoryService = {
       take: 12,
       orderBy: { createdAt: "desc" },
       include: {
-        item: { select: { name: true, sku: true, unit: true } },
+        item:    { select: { name: true, sku: true, unit: true } },
         supplier: { select: { name: true } },
-        user: userPublic,
+        user:    userPublic,
         booking: { select: { serviceName: true } },
       },
     });
@@ -592,8 +576,6 @@ export const inventoryService = {
     };
   },
 
-  /* ─────────────────── ITEM PRICES (multi-supplier) ─────────────────── */
-
   async listItemPrices(itemId: string) {
     return prisma.itemSupplier.findMany({
       where: { itemId },
@@ -607,27 +589,24 @@ export const inventoryService = {
     if (!item) throw ApiError.notFound("Item not found.");
 
     const supplierId = String(body.supplierId || "");
-    const supplier = await prisma.supplier.findUnique({ where: { id: supplierId } });
+    const supplier   = await prisma.supplier.findUnique({ where: { id: supplierId } });
     if (!supplier) throw ApiError.badRequest("Select a supplier for this price.");
 
     const priceNum = toNum(body.price);
     if (priceNum === null || priceNum < 0) throw ApiError.badRequest("Enter a valid price.");
-    const price = round2(priceNum);
+    const price       = round2(priceNum);
     const supplierSku = String(body.supplierSku || "");
-    const note = String(body.note || "");
-    const preferred = !!body.preferred;
+    const note        = String(body.note        || "");
+    const preferred   = !!body.preferred;
 
     const row = await prisma.$transaction(async (tx) => {
       if (preferred) {
-        await tx.itemSupplier.updateMany({
-          where: { itemId, NOT: { supplierId } },
-          data: { preferred: false },
-        });
+        await tx.itemSupplier.updateMany({ where: { itemId, NOT: { supplierId } }, data: { preferred: false } });
       }
       return tx.itemSupplier.upsert({
-        where: { itemId_supplierId: { itemId, supplierId } },
-        create: { itemId, supplierId, price, supplierSku, note, preferred },
-        update: { price, supplierSku, note, preferred },
+        where:   { itemId_supplierId: { itemId, supplierId } },
+        create:  { itemId, supplierId, price, supplierSku, note, preferred },
+        update:  { price, supplierSku, note, preferred },
         include: { supplier: { select: { id: true, name: true, phone: true, active: true } } },
       });
     }, TX_OPTS);
@@ -635,11 +614,9 @@ export const inventoryService = {
     return {
       result: row,
       audit: {
-        action: "inventory.item.price.set",
-        entityId: itemId,
-        entityRef: item.sku,
+        action: "inventory.item.price.set", entityId: itemId, entityRef: item.sku,
         summary: `Set ${supplier.name} price ₹${price.toFixed(2)} for ${item.name}`,
-        detail: { itemId, supplierId, price, preferred },
+        detail:  { itemId, supplierId, price, preferred },
       },
     };
   },
@@ -651,20 +628,15 @@ export const inventoryService = {
     });
     if (!existing || existing.itemId !== itemId) throw ApiError.notFound("Price not found.");
     await prisma.itemSupplier.delete({ where: { id: priceId } });
-
     return {
       result: { ok: true },
       audit: {
-        action: "inventory.item.price.delete",
-        entityId: itemId,
-        entityRef: existing.item?.sku || "",
+        action: "inventory.item.price.delete", entityId: itemId, entityRef: existing.item?.sku || "",
         summary: `Removed ${existing.supplier?.name || "a supplier"}'s price from ${existing.item?.name || "item"}`,
         detail: { itemId, priceId },
       },
     };
   },
-
-  /* ─────────────────────────── SUPPLIERS ─────────────────────────── */
 
   async listSuppliers() {
     const suppliers = await prisma.supplier.findMany({
@@ -678,9 +650,12 @@ export const inventoryService = {
     if (!String(body.name || "").trim()) throw ApiError.badRequest("Supplier name is required.");
     const supplier = await prisma.supplier.create({
       data: {
-        name: String(body.name).trim(),
-        phone: body.phone || "", email: body.email || "", gstin: body.gstin || "",
-        address: body.address || "", notes: body.notes || "",
+        name:    String(body.name).trim(),
+        phone:   body.phone   || "",
+        email:   body.email   || "",
+        gstin:   body.gstin   || "",
+        address: body.address || "",
+        notes:   body.notes   || "",
       },
     });
     return {
@@ -694,13 +669,13 @@ export const inventoryService = {
     if (!existing) throw ApiError.notFound("Supplier not found.");
 
     const data: Prisma.SupplierUpdateInput = {};
-    if (body.name !== undefined) data.name = String(body.name).trim();
-    if (body.phone !== undefined) data.phone = body.phone || "";
-    if (body.email !== undefined) data.email = body.email || "";
-    if (body.gstin !== undefined) data.gstin = body.gstin || "";
+    if (body.name    !== undefined) data.name    = String(body.name).trim();
+    if (body.phone   !== undefined) data.phone   = body.phone   || "";
+    if (body.email   !== undefined) data.email   = body.email   || "";
+    if (body.gstin   !== undefined) data.gstin   = body.gstin   || "";
     if (body.address !== undefined) data.address = body.address || "";
-    if (body.notes !== undefined) data.notes = body.notes || "";
-    if (body.active !== undefined) data.active = !!body.active;
+    if (body.notes   !== undefined) data.notes   = body.notes   || "";
+    if (body.active  !== undefined) data.active  = !!body.active;
 
     const supplier = await prisma.supplier.update({ where: { id }, data });
     return {
@@ -719,11 +694,8 @@ export const inventoryService = {
     };
   },
 
-  /* accounts-payable statement — summary from cached rollups (O(1)); ledger
-     bounded by limit; running balance anchored to the true current balance */
   async statement(id: string, limit: number) {
     const lim = Math.min(Math.max(limit || 200, 1), 1000);
-
     const supplier = await prisma.supplier.findUnique({ where: { id } });
     if (!supplier) throw ApiError.notFound("Supplier not found.");
 
@@ -778,9 +750,9 @@ export const inventoryService = {
       supplier: supplierView(supplier),
       summary: {
         totalPurchased: Number(supplier.totalPurchased),
-        totalPaid: Number(supplier.totalPaid),
-        balance: currentBalance,
-        purchaseCount, paymentCount,
+        totalPaid:      Number(supplier.totalPaid),
+        balance:        currentBalance,
+        purchaseCount,  paymentCount,
       },
       entries, shown: entries.length, totalEntries, truncated: totalEntries > entries.length,
     };
@@ -794,7 +766,7 @@ export const inventoryService = {
     if (amountRaw === null || amountRaw <= 0) throw ApiError.badRequest("Enter a payment amount greater than 0.");
     const amount = round2(amountRaw);
     const method = body.method === "online" ? "online" : "cash";
-    const note = String(body.note || "");
+    const note   = String(body.note || "");
     const paidAt = parseDate(body.paidAt) ?? new Date();
 
     const result = await prisma.$transaction(async (tx) => {
@@ -808,11 +780,9 @@ export const inventoryService = {
     return {
       result: { payment: result.payment, supplier: supplierView(result.supplier) },
       audit: {
-        action: "inventory.supplier.payment",
-        entityId: id,
-        entityRef: supplier.name,
+        action: "inventory.supplier.payment", entityId: id, entityRef: supplier.name,
         summary: `Paid ₹${amount.toFixed(2)} (${method}) to ${supplier.name}`,
-        detail: { amount, method, note, paymentId: result.payment.id },
+        detail:  { amount, method, note, paymentId: result.payment.id },
       },
     };
   },
@@ -830,21 +800,13 @@ export const inventoryService = {
     return {
       result: { ok: true, supplier: supplierView(supplier) },
       audit: {
-        action: "inventory.supplier.payment.delete",
-        entityId: id,
-        entityRef: supplier.name,
+        action: "inventory.supplier.payment.delete", entityId: id, entityRef: supplier.name,
         summary: `Removed a ₹${amount.toFixed(2)} ${payment.method} payment from ${supplier.name}`,
-        detail: { amount, method: payment.method, paymentId },
+        detail:  { amount, method: payment.method, paymentId },
       },
     };
   },
 
-  /* ─────────────────────────── PURCHASES ─────────────────────────── */
-
-  /* Record a purchase BILL. One transaction: bill header + line items + one
-     stock movement per line (frozen running balance) + each item's balance &
-     cost + each item↔supplier price row (lastRate) + the supplier account
-     debit. Bounded by line count, so it stays inside the transaction budget. */
   async createPurchase(body: PurchaseBody, userId: string): Promise<Write<unknown>> {
     const supplier = await prisma.supplier.findUnique({ where: { id: String(body.supplierId || "") } });
     if (!supplier) throw ApiError.notFound("Select a supplier for this purchase.");
@@ -852,22 +814,22 @@ export const inventoryService = {
     const rawItems = Array.isArray(body.items) ? body.items : [];
     const lines: { itemId: string; qty: number; rate: number }[] = [];
     for (const r of rawItems as any[]) {
-      const itemId = String(r?.itemId || "").trim();
-      const qty = toNum(r?.quantity);
-      const rate = toNum(r?.rate);
+      const itemId = String(r?.itemId  || "").trim();
+      const qty    = toNum(r?.quantity);
+      const rate   = toNum(r?.rate);
       if (!itemId || qty === null || qty <= 0 || rate === null || rate < 0) continue;
       lines.push({ itemId, qty: round3(qty), rate: round2(rate) });
     }
     if (!lines.length) throw ApiError.badRequest("Add at least one item with a quantity and rate.");
 
-    const ids = [...new Set(lines.map((l) => l.itemId))];
-    const items = await prisma.inventoryItem.findMany({ where: { id: { in: ids } } });
+    const ids     = [...new Set(lines.map((l) => l.itemId))];
+    const items   = await prisma.inventoryItem.findMany({ where: { id: { in: ids } } });
     const itemMap = new Map(items.map((it) => [it.id, it]));
     if (ids.some((id) => !itemMap.has(id))) throw ApiError.badRequest("One or more selected items no longer exist.");
 
     const dType = body.discType === "percent" ? "percent" : "amount";
-    const dVal = round2(toNum(body.discVal) ?? 0);
-    const tPct = toNum(body.taxPct) ?? 0;
+    const dVal  = round2(toNum(body.discVal) ?? 0);
+    const tPct  = toNum(body.taxPct) ?? 0;
 
     let subtotal = 0;
     const lineData = lines.map((l) => {
@@ -879,27 +841,26 @@ export const inventoryService = {
 
     let discountAmt = dType === "percent" ? round2((subtotal * dVal) / 100) : dVal;
     if (discountAmt > subtotal) discountAmt = subtotal;
-    if (discountAmt < 0) discountAmt = 0;
+    if (discountAmt < 0)       discountAmt = 0;
     const taxable = round2(subtotal - discountAmt);
-    const taxAmt = round2((taxable * tPct) / 100);
-    const total = round2(taxable + taxAmt);
+    const taxAmt  = round2((taxable * tPct) / 100);
+    const total   = round2(taxable + taxAmt);
+    const bd      = parseDate(body.billDate) ?? new Date();
 
-    const bd = parseDate(body.billDate) ?? new Date();
-
-    const runBal = new Map<string, number>();
-    for (const id of ids) runBal.set(id, Number(itemMap.get(id)!.quantity));
+    const runBal  = new Map<string, number>();
     const lastRate = new Map<string, number>();
+    for (const id of ids) runBal.set(id, Number(itemMap.get(id)!.quantity));
 
     const result = await prisma.$transaction(async (tx) => {
       const purchase = await tx.supplierPurchase.create({
         data: {
           supplierId: supplier.id,
-          billNo: String(body.billNo || "").trim(),
-          billDate: bd,
-          discType: dType as any,
+          billNo:     String(body.billNo || "").trim(),
+          billDate:   bd,
+          discType:   dType as any,
           discVal: dVal, taxPct: tPct,
           subtotal, discountAmt, taxAmt, total,
-          notes: body.notes || "",
+          notes:    body.notes || "",
           createdById: userId,
         },
       });
@@ -913,7 +874,7 @@ export const inventoryService = {
 
       const moveData: Prisma.StockMovementCreateManyInput[] = lineData.map((l) => {
         const before = runBal.get(l.itemId)!;
-        const after = round3(before + l.qty);
+        const after  = round3(before + l.qty);
         runBal.set(l.itemId, after);
         lastRate.set(l.itemId, l.rate);
         return {
@@ -927,11 +888,10 @@ export const inventoryService = {
         await tx.inventoryItem.update({ where: { id }, data: { quantity: runBal.get(id)!, costPrice: lastRate.get(id)! } });
       }
 
-      // refresh this supplier's per-item price row (lastRate); auto-create on first buy
       for (const id of ids) {
         const rate = lastRate.get(id)!;
         await tx.itemSupplier.upsert({
-          where: { itemId_supplierId: { itemId: id, supplierId: supplier.id } },
+          where:  { itemId_supplierId: { itemId: id, supplierId: supplier.id } },
           create: { itemId: id, supplierId: supplier.id, price: rate, lastRate: rate, lastPurchaseAt: bd },
           update: { lastRate: rate, lastPurchaseAt: bd },
         });
@@ -939,7 +899,7 @@ export const inventoryService = {
 
       const updatedSupplier = await tx.supplier.update({
         where: { id: supplier.id },
-        data: { totalPurchased: { increment: total }, lastPurchaseAt: bd },
+        data:  { totalPurchased: { increment: total }, lastPurchaseAt: bd },
       });
 
       return { purchase, supplier: updatedSupplier };
@@ -948,11 +908,11 @@ export const inventoryService = {
     return {
       result: { purchase: result.purchase, supplier: supplierView(result.supplier) },
       audit: {
-        action: "inventory.purchase.create",
-        entityId: result.purchase.id,
+        action:    "inventory.purchase.create",
+        entityId:  result.purchase.id,
         entityRef: supplier.name,
-        summary: `Purchase from ${supplier.name} · ₹${total.toFixed(2)} · ${lineData.length} item${lineData.length === 1 ? "" : "s"}${body.billNo ? ` · bill ${String(body.billNo).trim()}` : ""}`,
-        detail: { supplierId: supplier.id, billNo: String(body.billNo || "").trim(), subtotal, discountAmt, taxAmt, total, lines: lineData.length },
+        summary:   `Purchase from ${supplier.name} · ₹${total.toFixed(2)} · ${lineData.length} item${lineData.length === 1 ? "" : "s"}${body.billNo ? ` · bill ${String(body.billNo).trim()}` : ""}`,
+        detail:    { supplierId: supplier.id, billNo: String(body.billNo || "").trim(), subtotal, discountAmt, taxAmt, total, lines: lineData.length },
       },
     };
   },
@@ -961,42 +921,14 @@ export const inventoryService = {
     const purchase = await prisma.supplierPurchase.findUnique({
       where: { id },
       include: {
-        supplier: { select: { id: true, name: true, phone: true, email: true, gstin: true, address: true } },
-        items: { orderBy: { createdAt: "asc" } },
+        supplier:  { select: { id: true, name: true, phone: true, email: true, gstin: true, address: true } },
+        items:     { orderBy: { createdAt: "asc" } },
         createdBy: { select: { name: true } },
       },
     });
     if (!purchase) throw ApiError.notFound("Purchase not found.");
     return purchase;
   },
-
-  /* ──────────────── INVOICE STOCK SYNC (auto-deduct on billing) ────────────────
-
-     applyInvoiceStock  — called after a bill is CREATED (and when a cancelled
-       bill is reactivated). Writes one `consumption` movement per stock-linked
-       item (lines carrying items[].itemId), decrements each item's balance and
-       flips invoice.stockApplied=true. Idempotent: a bill already applied is a
-       no-op, so re-saving can never double-deduct. Negatives are ALLOWED (you
-       sometimes bill before logging a purchase) — the real balance is written
-       and the now-out / now-low items come back as warnings for the UI. APPLY
-       deducts per the bill's CURRENT linked lines.
-
-     reverseInvoiceStock — called when a bill is CANCELLED or DELETED. Gives back
-       exactly what this bill still HOLDS, read from the ledger: held = −Σ(delta)
-       across every StockMovement tagged with this invoiceId. Writing a `returned`
-       movement for that held amount drives the bill's net stock position to 0.
-       Because it reverses what ACTUALLY left the shelf (not what the lines now
-       say), it stays exact even if the bill's linked lines were edited after
-       billing (the phase-2 edit gap can't cause phantom stock), and it nets out
-       cleanly across repeated cancel⇄reactivate cycles. Guarded by stockApplied
-       so it never double-restocks. Ledger rows are never deleted; on a bill
-       delete the movements survive with invoiceId nulled (onDelete: SetNull),
-       the invoice number kept in each note.
-
-     Both run in their OWN transaction and are meant to be called best-effort
-     (non-fatal) from the invoice routes — a stock hiccup must never block or
-     roll back the bill itself. Aggregation is by item, so two lines pointing at
-     the same item make ONE movement. */
 
   async applyInvoiceStock(invoiceId: string, userId: string | null): Promise<InvoiceStockSync> {
     const invoice = await prisma.invoice.findUnique({
@@ -1007,25 +939,24 @@ export const inventoryService = {
 
     const totals = linkedLineTotals(invoice.items);
     if (totals.size === 0) {
-      // no stock-linked lines — still mark applied so a re-save doesn't re-scan
       await prisma.invoice.update({ where: { id: invoiceId }, data: { stockApplied: true } });
       return emptyStockSync();
     }
 
-    const ids = [...totals.keys()];
-    const items = await prisma.inventoryItem.findMany({ where: { id: { in: ids } } });
+    const ids     = [...totals.keys()];
+    const items   = await prisma.inventoryItem.findMany({ where: { id: { in: ids } } });
     const itemMap = new Map(items.map((it) => [it.id, it]));
-    const note = `Billed on ${invoice.invoiceNo}`;
+    const note    = `Billed on ${invoice.invoiceNo}`;
 
     const affected = await prisma.$transaction(async (tx) => {
       const moves: Prisma.StockMovementCreateManyInput[] = [];
-      const rows: AffectedItem[] = [];
+      const rows:  AffectedItem[] = [];
       for (const id of ids) {
-        const it = itemMap.get(id);
-        if (!it) continue; // linked item since deleted — skip, non-fatal
-        const qty = totals.get(id)!;
+        const it  = itemMap.get(id);
+        if (!it) continue;
+        const qty    = totals.get(id)!;
         const before = Number(it.quantity);
-        const after = round3(before - qty); // may go negative — allowed by design
+        const after  = round3(before - qty);
         moves.push({
           itemId: id, type: "consumption", quantity: qty, delta: round3(-qty), balance: after,
           unitCost: null, reference: invoice.invoiceNo, note, invoiceId, userId: userId ?? null,
@@ -1051,8 +982,6 @@ export const inventoryService = {
     const note = `Restocked (${reason}) ${invoice.invoiceNo}`;
 
     const affected = await prisma.$transaction(async (tx) => {
-      // what this bill still holds, from ITS OWN ledger rows (edit-proof + cycle-safe):
-      // held = −Σ(delta). Reversing that amount brings its net position to 0.
       const moves = await tx.stockMovement.findMany({
         where: { invoiceId },
         select: { itemId: true, delta: true },
@@ -1063,7 +992,7 @@ export const inventoryService = {
       const held: [string, number][] = [];
       for (const [id, d] of net) {
         const h = round3(-d);
-        if (h > 0.0005) held.push([id, h]); // only give back what's actually still out
+        if (h > 0.0005) held.push([id, h]);
       }
 
       if (!held.length) {
@@ -1071,8 +1000,8 @@ export const inventoryService = {
         return [] as AffectedItem[];
       }
 
-      const ids = held.map(([id]) => id);
-      const items = await tx.inventoryItem.findMany({ where: { id: { in: ids } } });
+      const ids     = held.map(([id]) => id);
+      const items   = await tx.inventoryItem.findMany({ where: { id: { in: ids } } });
       const itemMap = new Map(items.map((it) => [it.id, it]));
 
       const moveData: Prisma.StockMovementCreateManyInput[] = [];
@@ -1081,7 +1010,7 @@ export const inventoryService = {
         const it = itemMap.get(id);
         if (!it) continue;
         const before = Number(it.quantity);
-        const after = round3(before + qty);
+        const after  = round3(before + qty);
         moveData.push({
           itemId: id, type: "returned", quantity: qty, delta: qty, balance: after,
           unitCost: null, reference: invoice.invoiceNo, note, invoiceId, userId: userId ?? null,
