@@ -39,11 +39,20 @@ export interface StockWarning {
   id: string; name: string; sku: string; unit: string; quantity: number;
   kind: "out" | "low";
 }
+/* A billed line whose itemId no longer resolves to an InventoryItem — usually
+   because the item was deleted and re-created (new id, same name). These are
+   NEVER silently dropped: the invoice stays stockApplied=false so it can be
+   retried once the link is fixed, and the caller surfaces them to the user. */
+export interface UnresolvedLine { itemId: string; quantity: number; }
+
 export interface InvoiceStockSync {
   changed: boolean;
   movementCount: number;
   items: { id: string; name: string; sku: string; unit: string; quantity: number }[];
   warnings: StockWarning[];
+  unresolved: UnresolvedLine[];
+  /* set only by the route wrapper when the whole sync threw */
+  error?: string;
 }
 interface AffectedItem { id: string; name: string; sku: string; unit: string; quantity: number; reorderLevel: number; }
 
@@ -132,9 +141,15 @@ const linkedLineTotals = (itemsJson: unknown): Map<string, number> => {
   return out;
 };
 
-const emptyStockSync = (): InvoiceStockSync => ({ changed: false, movementCount: 0, items: [], warnings: [] });
+const emptyStockSync = (): InvoiceStockSync => ({
+  changed: false, movementCount: 0, items: [], warnings: [], unresolved: [],
+});
 
-const summarizeStockSync = (affected: AffectedItem[], flagLow: boolean): InvoiceStockSync => {
+const summarizeStockSync = (
+  affected: AffectedItem[],
+  flagLow: boolean,
+  unresolved: UnresolvedLine[] = [],
+): InvoiceStockSync => {
   const warnings: StockWarning[] = [];
   if (flagLow) {
     for (const it of affected) {
@@ -147,6 +162,7 @@ const summarizeStockSync = (affected: AffectedItem[], flagLow: boolean): Invoice
     movementCount: affected.length,
     items: affected.map((it) => ({ id: it.id, name: it.name, sku: it.sku, unit: it.unit, quantity: it.quantity })),
     warnings,
+    unresolved,
   };
 };
 
@@ -930,15 +946,34 @@ export const inventoryService = {
     return purchase;
   },
 
+  /* ── Billing → stock consumption ───────────────────────────────────────────
+     Writes one `consumption` StockMovement per stock-linked invoice line and
+     drops the item balance by that quantity, inside one transaction.
+
+     A line whose itemId no longer resolves to an InventoryItem (item deleted
+     and re-created, so the id changed) is reported in `unresolved` and the
+     invoice is left stockApplied=FALSE, so it can be retried once the link is
+     repaired. It is NEVER silently skipped — that was the old bug: a missing
+     item was ignored while stockApplied still flipped to true, permanently
+     losing that bill's deduction with no error anywhere. */
   async applyInvoiceStock(invoiceId: string, userId: string | null): Promise<InvoiceStockSync> {
     const invoice = await prisma.invoice.findUnique({
       where: { id: invoiceId },
       select: { id: true, invoiceNo: true, items: true, stockApplied: true },
     });
-    if (!invoice || invoice.stockApplied) return emptyStockSync();
+    if (!invoice) {
+      console.warn(`[stock] apply skipped — invoice ${invoiceId} not found`);
+      return emptyStockSync();
+    }
+    if (invoice.stockApplied) {
+      console.log(`[stock] apply skipped — ${invoice.invoiceNo} already applied`);
+      return emptyStockSync();
+    }
 
     const totals = linkedLineTotals(invoice.items);
     if (totals.size === 0) {
+      // nothing on this bill is linked to inventory — nothing to ever retry
+      console.log(`[stock] ${invoice.invoiceNo}: no stock-linked lines (no itemId on any item)`);
       await prisma.invoice.update({ where: { id: invoiceId }, data: { stockApplied: true } });
       return emptyStockSync();
     }
@@ -948,12 +983,25 @@ export const inventoryService = {
     const itemMap = new Map(items.map((it) => [it.id, it]));
     const note    = `Billed on ${invoice.invoiceNo}`;
 
+    const unresolved: UnresolvedLine[] = ids
+      .filter((id) => !itemMap.has(id))
+      .map((id) => ({ itemId: id, quantity: totals.get(id)! }));
+
+    if (unresolved.length) {
+      console.warn(
+        `[stock] ${invoice.invoiceNo}: ${unresolved.length} line(s) point at inventory items that no longer exist ` +
+        `(${unresolved.map((u) => u.itemId).join(", ")}) — leaving stockApplied=false so it can be retried`,
+      );
+    }
+
+    console.log(`[stock] ${invoice.invoiceNo}: applying ${itemMap.size} of ${ids.length} linked line(s)`);
+
     const affected = await prisma.$transaction(async (tx) => {
       const moves: Prisma.StockMovementCreateManyInput[] = [];
       const rows:  AffectedItem[] = [];
       for (const id of ids) {
-        const it  = itemMap.get(id);
-        if (!it) continue;
+        const it = itemMap.get(id);
+        if (!it) continue;                       // reported in `unresolved` above
         const qty    = totals.get(id)!;
         const before = Number(it.quantity);
         const after  = round3(before - qty);
@@ -965,11 +1013,18 @@ export const inventoryService = {
         rows.push({ id, name: it.name, sku: it.sku, unit: it.unit, quantity: after, reorderLevel: Number(it.reorderLevel) });
       }
       if (moves.length) await tx.stockMovement.createMany({ data: moves });
-      await tx.invoice.update({ where: { id: invoiceId }, data: { stockApplied: true } });
+      // only mark the bill done when EVERY linked line was actually applied
+      if (!unresolved.length) {
+        await tx.invoice.update({ where: { id: invoiceId }, data: { stockApplied: true } });
+      }
       return rows;
     }, TX_OPTS);
 
-    return summarizeStockSync(affected, true);
+    for (const r of affected) {
+      console.log(`[stock]   ${r.name} (${r.sku}) → ${r.quantity} ${r.unit}`);
+    }
+
+    return summarizeStockSync(affected, true, unresolved);
   },
 
   async reverseInvoiceStock(invoiceId: string, reason: string, userId: string | null): Promise<InvoiceStockSync> {
@@ -980,6 +1035,7 @@ export const inventoryService = {
     if (!invoice || !invoice.stockApplied) return emptyStockSync();
 
     const note = `Restocked (${reason}) ${invoice.invoiceNo}`;
+    const unresolved: UnresolvedLine[] = [];
 
     const affected = await prisma.$transaction(async (tx) => {
       const moves = await tx.stockMovement.findMany({
@@ -1008,7 +1064,7 @@ export const inventoryService = {
       const rows: AffectedItem[] = [];
       for (const [id, qty] of held) {
         const it = itemMap.get(id);
-        if (!it) continue;
+        if (!it) { unresolved.push({ itemId: id, quantity: qty }); continue; }
         const before = Number(it.quantity);
         const after  = round3(before + qty);
         moveData.push({
@@ -1023,7 +1079,11 @@ export const inventoryService = {
       return rows;
     }, TX_OPTS);
 
-    return summarizeStockSync(affected, false);
+    if (unresolved.length) {
+      console.warn(`[stock] ${invoice.invoiceNo}: ${unresolved.length} item(s) could not be restocked — item no longer exists`);
+    }
+
+    return summarizeStockSync(affected, false, unresolved);
   },
 };
 

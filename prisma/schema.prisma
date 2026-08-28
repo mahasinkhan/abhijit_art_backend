@@ -40,12 +40,12 @@ enum StockUnit {
 }
 
 enum MovementType {
-  opening      // starting balance when the item is created
-  purchase     // stock in from a supplier
-  consumption  // used on a job / booking
-  wastage      // misprint, damage, offcut loss
-  returned     // unused stock back on the shelf, or sent back to supplier
-  adjustment   // physical stock-count correction (can go either way)
+  opening
+  purchase
+  consumption
+  wastage
+  returned
+  adjustment
 }
 
 enum CustomerSource {
@@ -65,15 +65,11 @@ enum InvoiceStatus {
   cancelled
 }
 
-// how a single payment was made — cash vs online (UPI / card / bank transfer)
 enum PaymentMethod {
   cash
   online
 }
 
-// ─────────────────────────────── TASKS ───────────────────────────────
-
-// lifecycle of an employee task
 enum TaskStatus {
   pending
   in_progress
@@ -81,7 +77,6 @@ enum TaskStatus {
   cancelled
 }
 
-// urgency set by the admin when assigning
 enum TaskPriority {
   low
   medium
@@ -104,8 +99,8 @@ model User {
   tasksAssigned  Task[]          @relation("TasksAssigned")
   tasksCreated   Task[]          @relation("TasksCreated")
   tasksDelivered Task[]          @relation("TasksDelivered")
-  khataEntries   KhataEntry[]    @relation("KhataCreated")
-  // supplier ledger — who recorded a purchase bill / a payment to a supplier
+  quickOrders    QuickOrder[]    @relation("QuickOrderCreated")
+  quickOrderPayments QuickOrderPayment[] @relation("QuickOrderPaymentCreated")
   purchasesCreated SupplierPurchase[] @relation("PurchaseCreated")
   supplierPayments SupplierPayment[]  @relation("SupplierPaymentCreated")
   createdAt      DateTime        @default(now())
@@ -141,18 +136,15 @@ model Booking {
   address        String          @default("")
   preferredDate  DateTime?
   designLink     String          @default("")
-  totalAmount    Int?            // admin-set order total (₹) — required before confirmed/completed
-  // price breakdown behind totalAmount, so the client invoice can show real
-  // Discount/GST lines. All money is Int (whole ₹) to match totalAmount, and
-  // total = subtotal − discountAmount + taxAmount exactly.
-  unitRate       Decimal?        @db.Decimal(12, 2)  // rate/unit — the one field that may carry paise
+  totalAmount    Int?
+  unitRate       Decimal?        @db.Decimal(12, 2)
   subtotal       Int?
-  discountType   String?                             // "amount" | "percent"
-  discountValue  Decimal?        @db.Decimal(12, 2)  // what was typed (₹150.50 or 7.5%)
+  discountType   String?
+  discountValue  Decimal?        @db.Decimal(12, 2)
   discountAmount Int?
   taxPercent     Decimal?        @db.Decimal(5, 2)
   taxAmount      Int?
-  rating         Int?            // client's 1–5 star rating (BookingDetails already reads this)
+  rating         Int?
   status         BookingStatus   @default(pending)
   stockMovements StockMovement[]
   createdAt      DateTime        @default(now())
@@ -180,8 +172,6 @@ model Lead {
   updatedAt DateTime @updatedAt
 }
 
-// ───────────────────────────── INVENTORY ─────────────────────────────
-
 model Supplier {
   id        String          @id @default(cuid())
   name      String
@@ -193,95 +183,58 @@ model Supplier {
   active    Boolean         @default(true)
   items     InventoryItem[]
   movements StockMovement[]
-
-  // ── account ledger (accounts payable) ────────────────────────────────
-  // Cached rollups, kept in sync inside the SAME transaction as every
-  // purchase / payment. This is what makes the supplier list O(1): showing
-  // each vendor's outstanding balance never has to scan the purchase/payment
-  // ledger, so the list stays fast no matter how many years of bills pile up.
-  //   balance owed = totalPurchased − totalPaid   (derived on read)
-  totalPurchased Decimal   @default(0) @db.Decimal(14, 2) // Σ of purchase-bill totals
-  totalPaid      Decimal   @default(0) @db.Decimal(14, 2) // Σ of payments made
-  lastPurchaseAt DateTime?                                 // drives "last purchase" on the card
-
+  totalPurchased Decimal   @default(0) @db.Decimal(14, 2)
+  totalPaid      Decimal   @default(0) @db.Decimal(14, 2)
+  lastPurchaseAt DateTime?
   purchases  SupplierPurchase[]
   payments   SupplierPayment[]
   itemPrices ItemSupplier[]
-
   createdAt DateTime        @default(now())
   updatedAt DateTime        @updatedAt
-
   @@index([name])
 }
 
 model InventoryItem {
   id          String    @id @default(cuid())
-  // code on the rack label, e.g. FLX-3X50-WHT
   sku         String    @unique
   name        String
   description String    @default("")
-  // free text so a new category needs no migration
   category    String    @default("")
   unit        StockUnit @default(piece)
-
-  // Running balance. Never write this directly — always go through a
-  // StockMovement inside a transaction so the ledger and the balance
-  // can never drift apart.
-  // Decimal, not Int: flex is billed in sqft (34.5), ink in litres (2.75).
   quantity     Decimal @default(0) @db.Decimal(14, 3)
-  // quantity <= reorderLevel flags the item as LOW on the dashboard
   reorderLevel Decimal @default(0) @db.Decimal(14, 3)
-
-  // Per-unit rates. Decimal because printing rates are routinely ₹12.50/sqft.
   costPrice Decimal  @default(0) @db.Decimal(12, 2)
   sellPrice Decimal? @db.Decimal(12, 2)
-
-  // where it physically sits: "Rack B / Shelf 2"
   location String  @default("")
   imageUrl String  @default("")
   active   Boolean @default(true)
-
   supplierId String?
   supplier   Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
-
   movements      StockMovement[]
   purchaseLines  SupplierPurchaseItem[]
   supplierPrices ItemSupplier[]
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
   @@index([name])
   @@index([category])
   @@index([active])
 }
 
-// Per-supplier pricing for an item. The SAME item (e.g. "FLEX 220 GSM") can be
-// bought from several suppliers at DIFFERENT rates — one row here per
-// item↔supplier pair holds that supplier's quoted price, so the item can show
-// and compare all of them and flag a preferred/cheapest source. Recording a
-// purchase refreshes lastRate/lastPurchaseAt for the matching pair, giving a
-// per-supplier price history to reorder against.
 model ItemSupplier {
   id         String        @id @default(cuid())
   item       InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
   itemId     String
   supplier   Supplier      @relation(fields: [supplierId], references: [id], onDelete: Cascade)
   supplierId String
-
-  price       Decimal @db.Decimal(12, 2) // this supplier's quoted rate for the item
-  supplierSku String  @default("")        // supplier's own code for it (optional)
-  preferred   Boolean @default(false)     // the go-to supplier for this item
+  price       Decimal @db.Decimal(12, 2)
+  supplierSku String  @default("")
+  preferred   Boolean @default(false)
   note        String  @default("")
-
-  // auto-filled from the last actual purchase of this item from this supplier
   lastRate       Decimal?  @db.Decimal(12, 2)
   lastPurchaseAt DateTime?
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
-  @@unique([itemId, supplierId]) // one price row per item↔supplier pair
+  @@unique([itemId, supplierId])
   @@index([itemId])
   @@index([supplierId])
 }
@@ -290,49 +243,24 @@ model StockMovement {
   id     String        @id @default(cuid())
   item   InventoryItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
   itemId String
-
   type MovementType
-
-  // Always positive — what the user typed in.
   quantity Decimal @db.Decimal(14, 3)
-  // Signed value actually applied to the balance. purchase/returned/opening
-  // are positive, consumption/wastage negative, adjustment either way.
-  // Pre-signing this makes every report a simple SUM.
   delta    Decimal @db.Decimal(14, 3)
-  // Balance immediately AFTER this movement, frozen at write time, so
-  // history reads without replaying the whole ledger.
   balance  Decimal @db.Decimal(14, 3)
-
-  // per-unit cost on a purchase; null on every other type
   unitCost Decimal? @db.Decimal(12, 2)
-
-  // supplier bill / challan number
   reference String @default("")
   note      String @default("")
-
   supplierId String?
   supplier   Supplier? @relation(fields: [supplierId], references: [id], onDelete: SetNull)
-
-  // the purchase bill that created this stock-in row (null for a manual Move)
   purchase   SupplierPurchase? @relation(fields: [purchaseId], references: [id], onDelete: SetNull)
   purchaseId String?
-
-  // which job consumed this stock — enables per-order costing
   booking   Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
   bookingId String?
-
-  // the bill (invoice) that consumed this stock (consumption) or handed it
-  // back (returned, on cancel/delete). Set when auto-deducting on billing.
-  // SetNull so the ledger row survives if the invoice is later deleted.
   invoice   Invoice? @relation("InvoiceStock", fields: [invoiceId], references: [id], onDelete: SetNull)
   invoiceId String?
-
-  // who recorded it — the audit trail
   user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
   userId String?
-
   createdAt DateTime @default(now())
-
   @@index([itemId, createdAt])
   @@index([type])
   @@index([bookingId])
@@ -340,317 +268,214 @@ model StockMovement {
   @@index([invoiceId])
 }
 
-// A purchase bill / GRN from a supplier. The header carries the money (what
-// you owe for this bill); the lines carry which stock came in. Recording a
-// purchase writes one StockMovement per line (adding stock) AND bumps the
-// supplier's cached totalPurchased + lastPurchaseAt — all inside one
-// transaction, so stock, the bill and the account balance can never disagree.
-// This is the "middle" record that ties a supplier to their stock + the debt.
 model SupplierPurchase {
   id         String   @id @default(cuid())
   supplier   Supplier @relation(fields: [supplierId], references: [id], onDelete: Cascade)
   supplierId String
-
-  billNo   String   @default("") // supplier's invoice / challan number (not unique)
-  billDate DateTime               // date printed on the bill (may differ from entry time)
-
-  // charges as entered on the bill
+  billNo   String   @default("")
+  billDate DateTime
   discType DiscountType @default(amount)
   discVal  Decimal      @default(0) @db.Decimal(12, 2)
   taxPct   Decimal      @default(0) @db.Decimal(5, 2)
-
-  // frozen totals, computed server-side. total is the debit added to the
-  // supplier account: subtotal − discountAmt + taxAmt.
   subtotal    Decimal @db.Decimal(14, 2)
   discountAmt Decimal @default(0) @db.Decimal(14, 2)
   taxAmt      Decimal @default(0) @db.Decimal(14, 2)
   total       Decimal @db.Decimal(14, 2)
-
   notes String @default("")
-
   items     SupplierPurchaseItem[]
-  movements StockMovement[] // the stock-in rows this bill created
-
+  movements StockMovement[]
   createdBy   User?   @relation("PurchaseCreated", fields: [createdById], references: [id], onDelete: SetNull)
   createdById String?
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
   @@index([supplierId, billDate])
   @@index([billDate])
   @@index([billNo])
 }
 
-// One line of a purchase bill: which item, how much, at what rate. name/unit
-// are snapshotted so the line still reads if the item is later renamed/deleted.
 model SupplierPurchaseItem {
   id         String           @id @default(cuid())
   purchase   SupplierPurchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
   purchaseId String
-
   item   InventoryItem? @relation(fields: [itemId], references: [id], onDelete: SetNull)
   itemId String?
-  name   String                      // snapshot of the item name at purchase time
-  unit   StockUnit @default(piece)   // snapshot of the unit
-
+  name   String
+  unit   StockUnit @default(piece)
   quantity Decimal @db.Decimal(14, 3)
   rate     Decimal @db.Decimal(12, 2)
-  amount   Decimal @db.Decimal(14, 2) // quantity × rate
-
+  amount   Decimal @db.Decimal(14, 2)
   createdAt DateTime @default(now())
-
   @@index([purchaseId])
   @@index([itemId])
 }
 
-// A payment MADE to a supplier — account-level (khata style), not tied to a
-// specific bill. Append-only; each row is cash or online. The supplier's
-// cached totalPaid is always the SUM of these. Deleting a row is a correction
-// (PIN-gated + audited). balance owed = totalPurchased − totalPaid.
 model SupplierPayment {
   id         String        @id @default(cuid())
   supplier   Supplier      @relation(fields: [supplierId], references: [id], onDelete: Cascade)
   supplierId String
   amount     Decimal       @db.Decimal(14, 2)
   method     PaymentMethod @default(cash)
-  note       String        @default("") // optional ref, e.g. "UPI 4821" / "cheque 00123"
+  note       String        @default("")
   paidAt     DateTime      @default(now())
-
   createdBy   User?   @relation("SupplierPaymentCreated", fields: [createdById], references: [id], onDelete: SetNull)
   createdById String?
-
   createdAt DateTime @default(now())
-
   @@index([supplierId, paidAt])
 }
-
-// ───────────────────────── BILLING / INVOICES ─────────────────────────
 
 model Invoice {
   id          String   @id @default(cuid())
   invoiceNo   String   @unique
   date        DateTime
-
-  // billed-to snapshot (frozen so a saved bill always shows who it was for)
   clientName  String
   clientPhone String?
   clientEmail String?
   clientGstin String?
   clientAddr  String?
-
-  // registered (online) customer vs walk-in (offline) — shown as a badge,
-  // switchable when editing the bill. Reuses the CustomerSource enum.
   source      CustomerSource @default(offline)
-
-  // full snapshots so a saved bill re-renders exactly as it was issued
-  business    Json     // { name, address, phone, email, gstin, pan }
-  items       Json     // [{ desc, qty, rate, itemId? }]  — itemId links a line to an InventoryItem for stock auto-deduct
-
-  // charges as entered
+  business    Json
+  items       Json
   discType    DiscountType @default(amount)
   discVal     Decimal      @default(0) @db.Decimal(12, 2)
   taxPct      Decimal      @default(0) @db.Decimal(5, 2)
-
-  // totals frozen at save time (computed on the server)
   subtotal    Decimal  @db.Decimal(12, 2)
   discountAmt Decimal  @db.Decimal(12, 2)
   taxAmt      Decimal  @db.Decimal(12, 2)
   total       Decimal  @db.Decimal(12, 2)
-
-  // amount received so far = cached SUM of the payments below; balance due =
-  // total − paidAmount. Recomputed server-side whenever a payment changes.
   paidAmount  Decimal  @default(0) @db.Decimal(12, 2)
-
-  // itemised payment history — each cash/online payment (incl. the advance)
-  // is one row here; this is the source of truth for how much is paid.
   payments    Payment[]
-
   notes       String?
   warranty    String?
-
-  // ── CONCESSION / BARGAINING ──────────────────────────────────────────
-  // Amount the admin chose to concede during negotiation (e.g. ₹500 off on
-  // a ₹10 000 bill). Purely informational — NEVER changes total, subtotal,
-  // paidAmount or any other computed figure. Visible to admin only; never
-  // printed on the customer PDF or sent in email/WhatsApp.
   lessAmount  Decimal  @default(0) @db.Decimal(12, 2)
-
-  // ── STOCK AUTO-DEDUCT ────────────────────────────────────────────────
-  // true once this bill's stock-linked line items have had their consumption
-  // movements written, so a re-save can never double-deduct. Cancel/delete
-  // reverses them (returned movements) and flips this back to false. The
-  // movements themselves link back here via StockMovement.invoiceId.
   stockApplied   Boolean         @default(false)
   stockMovements StockMovement[] @relation("InvoiceStock")
-
-  // payment-reminder tracking — when this client was last nudged about a
-  // balance due + how many reminders have been sent (email or WhatsApp).
   lastRemindedAt DateTime?
   reminderCount  Int      @default(0)
-
   status      InvoiceStatus @default(unpaid)
-
-  // who created it — audit trail; SetNull so deleting an admin never drops a bill
   createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
   createdById String?
-
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
-
   @@index([createdAt])
   @@index([clientName])
   @@index([status])
 }
 
-// One received payment against an invoice — the advance at billing time, or
-// any later part payment. Append-only history: each row records how much was
-// paid and by cash or online. Deleting a row (a correction) is PIN-gated and
-// audited. The invoice's paidAmount is always the SUM of its payments.
 model Payment {
   id        String        @id @default(cuid())
   invoice   Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   invoiceId String
   amount    Decimal       @db.Decimal(12, 2)
   method    PaymentMethod @default(cash)
-  note      String        @default("") // optional ref, e.g. "UPI 4821" / "cash at counter"
-
-  // who recorded it — survives if the user is later deleted
+  note      String        @default("")
   createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
   createdById String?
-
   createdAt DateTime @default(now())
-
   @@index([invoiceId, createdAt])
 }
 
-// ─────────────────────────────── TASKS ───────────────────────────────
-
-// A task the admin assigns to an employee. Carries the instructions,
-// reference images (uploaded → /uploads/tasks/…) and reference links, plus
-// the priority/deadline. The employee updates status + notes as they work;
-// every change is broadcast over Socket.IO so admin sees progress live.
 model Task {
   id          String       @id @default(cuid())
   title       String
   description String?
-  images      String[]     // uploaded reference image paths, e.g. /uploads/tasks/xxx.jpg
-  links       String[]     // external reference links (Drive, refs, etc.)
+  images      String[]
+  links       String[]
   priority    TaskPriority @default(medium)
   status      TaskStatus   @default(pending)
   deadline    DateTime?
-  notes       String?      // employee's progress / completion notes
-
-  // progress-timeline timestamps, set by the backend on status change:
-  // createdAt = assigned, startedAt = moved to in_progress, completedAt = done
+  notes       String?
   startedAt   DateTime?
   completedAt DateTime?
-
-  // delivery — which staff member physically handed the finished order to the
-  // customer, and when. Set when a COMPLETED task is marked delivered by the
-  // assigned employee (or admin). This is what admin reads to see who
-  // delivered each order. SetNull keeps the record if that user is later
-  // removed. Moving the task back out of "completed" clears these fields
-  // (handled in the routes) — you can't have delivered an unfinished task.
   deliveredAt   DateTime?
   deliveredBy   User?    @relation("TasksDelivered", fields: [deliveredById], references: [id], onDelete: SetNull)
   deliveredById String?
-
-  // customer work-order details — this task is tied to a customer job.
-  // Stored as a snapshot (like an invoice's client fields) so the order
-  // always shows who it was for, even if the customer record changes.
   customerName  String?
   customerPhone String?
   customerEmail String?
-  orderDate     DateTime?  // when the customer placed the order
-  amount        Int       @default(0)  // total order value in ₹ (fetched from the bill)
-  advancePaid   Int       @default(0)  // advance received in ₹; due = amount − advancePaid
-
-  // the bill this task was created from — amount + customer + items come from it
+  orderDate     DateTime?
+  amount        Int       @default(0)
+  advancePaid   Int       @default(0)
   invoiceId     String?
   invoiceNo     String?
-
-  // the employee this task is assigned to
+  quickOrder   QuickOrder? @relation("QuickOrderTask", fields: [quickOrderId], references: [id], onDelete: SetNull)
+  quickOrderId String?     @unique
   assignedTo   User   @relation("TasksAssigned", fields: [assignedToId], references: [id])
   assignedToId String
-  // the admin who created / assigned it
   createdBy    User   @relation("TasksCreated", fields: [createdById], references: [id])
   createdById  String
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
-
   @@index([assignedToId, status])
   @@index([status])
   @@index([createdAt])
   @@index([deliveredById])
+  @@index([quickOrderId])
 }
 
-// ───────────────────────── SECURITY / AUDIT ─────────────────────────
-
-// Generic key/value config store. Holds the hashed billing PIN under the
-// key "billing_pin_hash" (bcrypt). Reusable for future settings.
 model Setting {
   key       String   @id
   value     String
   updatedAt DateTime @updatedAt
 }
 
-// Tamper trail: one row per sensitive action, so any change to the records
-// is attributable to who + when + what. Never edited or deleted from the app.
 model AuditLog {
   id        String   @id @default(cuid())
-  action    String   // "invoice.create" | "invoice.payment" | "invoice.status" | "invoice.cancel" | "invoice.delete" | "invoice.edit" | "invoice.remind" | "inventory.purchase.create" | "inventory.supplier.payment" | "inventory.supplier.payment.delete" | "inventory.item.price.set" | "inventory.item.price.delete"
+  action    String
   entity    String   @default("invoice")
-  entityId  String?  // the affected record's id
-  entityRef String   @default("") // human handle, e.g. the invoice number
-  summary   String   // one-line human description of what happened
-  detail    Json?    // structured before/after (amounts, status, …)
+  entityId  String?
+  entityRef String   @default("")
+  summary   String
+  detail    Json?
   actorId   String?
   actor     User?    @relation(fields: [actorId], references: [id], onDelete: SetNull)
-  actorName String   @default("") // frozen name, survives if the user is later deleted
+  actorName String   @default("")
   ip        String   @default("")
   createdAt DateTime @default(now())
-
   @@index([createdAt])
   @@index([entity, entityId])
   @@index([action])
 }
 
-// ─────────────────────────────── KHATA ───────────────────────────────
-
-// Daily ledger entry — quick cash-counter style order record.
-// Can be converted to a full Invoice later.
-enum KhataStatus {
-  unbilled   // quick entry, no invoice yet
-  billed     // converted to an Invoice
+enum QuickOrderStatus {
+  unbilled
+  billed
 }
 
-model KhataEntry {
+model QuickOrder {
   id            String        @id @default(cuid())
 
-  // customer snapshot (same pattern as Invoice / Task)
-  customerId    String?       // link to User if they exist in DB
+  // customer snapshot
+  customerId    String?
   customerName  String
   customerPhone String        @default("")
   customerEmail String        @default("")
+  whatsapp      String?       // ── NEW: WhatsApp number (if different from phone)
 
-  // what they ordered — same Json shape as Invoice.items
-  items         Json          // [{ desc, qty, rate }]
-  description   String        @default("")  // optional free-text note
+  // what the job is
+  title         String?       // ── NEW: short order label / title (optional)
+  workDetails   String        @default("")
+  items         Json          @default("[]")
+  description   String        @default("")
+
+  // reference images uploaded by admin (uploaded via /uploads/quick-orders/)
+  images        String[]      @default([])
 
   // money
-  amount        Decimal       @db.Decimal(12, 2)  // total order value
+  amount        Decimal       @db.Decimal(12, 2)
   advancePaid   Decimal       @default(0) @db.Decimal(12, 2)
   paymentMethod PaymentMethod @default(cash)
 
-  // lifecycle
-  status        KhataStatus   @default(unbilled)
-  invoiceId     String?       // set when converted to invoice
+  // billing lifecycle
+  status        QuickOrderStatus @default(unbilled)
+  invoiceId     String?
   invoiceNo     String?
 
+  // work assignment (1:1 Task via quickOrderId @unique)
+  task          Task?         @relation("QuickOrderTask")
+  payments      QuickOrderPayment[] @relation("QuickOrderPayments")
+
   // who created it
-  createdBy     User?         @relation("KhataCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdBy     User?         @relation("QuickOrderCreated", fields: [createdById], references: [id], onDelete: SetNull)
   createdById   String?
 
   entryDate     DateTime      @default(now())
@@ -661,4 +486,22 @@ model KhataEntry {
   @@index([customerName])
   @@index([status])
   @@index([customerId])
+}
+
+// ── QUICK ORDER PAYMENTS ─────────────────────────────────────────────
+// Append-only payment ledger for a Quick Order. Each cash/online
+// payment recorded by admin gets one row here. advancePaid on the
+// parent QuickOrder is always the SUM of these rows.
+model QuickOrderPayment {
+  id        String        @id @default(cuid())
+  order     QuickOrder    @relation("QuickOrderPayments", fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String
+  amount    Decimal       @db.Decimal(12, 2)
+  method    PaymentMethod @default(cash)
+  note      String        @default("")
+  createdBy User?         @relation("QuickOrderPaymentCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt DateTime      @default(now())
+
+  @@index([orderId, createdAt])
 }

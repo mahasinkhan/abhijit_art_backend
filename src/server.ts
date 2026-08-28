@@ -26,7 +26,7 @@ import inventoryRoutes from "./routes/inventoryRoutes.js";
 import invoiceRoutes from "./routes/invoiceRoutes.js";
 import securityRoutes from "./routes/securityRoutes.js";
 import taskRoutes from "./routes/taskRoutes.js";
-import khataRoutes from "./routes/khataRoutes.js";
+import quickOrderRoutes from "./routes/quickOrderRoutes.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -92,22 +92,22 @@ io.on("connection", (socket) => {
 
 // ── Routes ─────────────────────────────────────────────────────────────────
 app.get("/", (_req: Request, res: Response) => res.send("Avijit Art API is running 🎨"));
-app.use("/api/auth",      authRoutes);
-app.use("/api/services",  serviceRoutes);
-app.use("/api/bookings",  bookingRoutes);
-app.use("/api/posts",     postRoutes);
+app.use("/api/auth",          authRoutes);
+app.use("/api/services",      serviceRoutes);
+app.use("/api/bookings",      bookingRoutes);
+app.use("/api/posts",         postRoutes);
 // Chatbot leads. New semantic path:
-app.use("/api/leads",     leadRoutes);
+app.use("/api/leads",         leadRoutes);
 // Backward-compat alias so the existing ChatWidget (POST /api/visitors/lead)
 // keeps working with no frontend change. Remove this line once the ChatWidget
 // is switched over to /api/leads.
-app.use("/api/visitors",  leadRoutes);
-app.use("/api/users",     userRoutes);
-app.use("/api/inventory", inventoryRoutes);
-app.use("/api/invoices",  invoiceRoutes);
-app.use("/api/security",  securityRoutes);
-app.use("/api/tasks",     taskRoutes);
-app.use("/api/khata",     khataRoutes);
+app.use("/api/visitors",      leadRoutes);
+app.use("/api/users",         userRoutes);
+app.use("/api/inventory",     inventoryRoutes);
+app.use("/api/invoices",      invoiceRoutes);
+app.use("/api/security",      securityRoutes);
+app.use("/api/tasks",         taskRoutes);
+app.use("/api/quick-orders",  quickOrderRoutes);
 
 // ── Error handling (must come AFTER every route) ─────────────────────────────
 // Any request that matched no route above falls through to notFound; anything
