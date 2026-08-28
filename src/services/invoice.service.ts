@@ -50,10 +50,6 @@ export const asSource = (v: unknown, fallback: "online" | "offline"): "online" |
 export const asMethod = (v: unknown, fallback: "cash" | "online"): "cash" | "online" =>
   v === "cash" ? "cash" : v === "online" ? "online" : fallback;
 
-/* normalise a line for storage — keeps an optional itemId (links the line to an
-   InventoryItem so billing can auto-deduct that stock). Lines with no itemId
-   are pure services and never touch inventory. Persisted on create AND edit so
-   the link survives a later cancel/delete restock. */
 export const mapLine = (it: Line) => {
   const line: { desc: string; qty: number; rate: number; itemId?: string } = {
     desc: str(it.desc), qty: num(it.qty), rate: num(it.rate),
@@ -111,6 +107,60 @@ function resolveLogoPath(): string | null {
 }
 export const reminderLogoPath = resolveLogoPath();
 
+// ── Customer upsert ───────────────────────────────────────────────────────────
+// Called on every invoice save. Phone is the unique key.
+// If phone exists → update name/email/gstin/address if changed.
+// If no phone → create by name (no unique constraint, so always create).
+// Best-effort: never throws — a customer link failure must not fail the invoice.
+export async function upsertCustomer(client: Party, source: "online" | "offline"): Promise<string | null> {
+  try {
+    const phone = str(client.phone).replace(/\D/g, "").slice(-10) || null;
+    const name  = str(client.name) || "—";
+
+    if (phone) {
+      const customer = await prisma.customer.upsert({
+        where:  { phone },
+        update: {
+          name,
+          email:   str(client.email)   || undefined,
+          gstin:   str(client.gstin)   || undefined,
+          address: str(client.address) || undefined,
+        },
+        create: {
+          phone,
+          name,
+          email:   str(client.email)   || null,
+          gstin:   str(client.gstin)   || null,
+          address: str(client.address) || null,
+          source,
+        },
+      });
+      return customer.id;
+    }
+
+    // No phone — find by exact name or create new
+    const existing = await prisma.customer.findFirst({
+      where: { phone: null, name: { equals: name, mode: "insensitive" } },
+    });
+    if (existing) return existing.id;
+
+    const created = await prisma.customer.create({
+      data: {
+        name,
+        phone:   null,
+        email:   str(client.email)   || null,
+        gstin:   str(client.gstin)   || null,
+        address: str(client.address) || null,
+        source,
+      },
+    });
+    return created.id;
+  } catch (e) {
+    console.error("⚠️  upsertCustomer failed (non-fatal):", (e as Error).message);
+    return null;
+  }
+}
+
 // ── invoice recompute (paidAmount + status from its payments) ────────────────
 export const withPayments = { payments: { orderBy: { createdAt: "asc" as const } } };
 
@@ -129,12 +179,6 @@ export async function recomputeInvoice(invoiceId: string, opts: { reactivate?: b
   });
 }
 
-/* ── stock auto-deduct (billing) — best-effort wrappers ──
-   A stock hiccup must NEVER fail or roll back the bill. But it must never be
-   INVISIBLE either: a throw is returned as a stock object carrying `error`, so
-   the route can hand it to the client and the Billing tab can show a warning.
-   applyInvoiceStock/reverseInvoiceStock are idempotent (guarded by
-   invoice.stockApplied), so calling them again is always safe. */
 const stockFailure = (message: string): InvoiceStockSync => ({
   changed: false, movementCount: 0, items: [], warnings: [], unresolved: [], error: message,
 });
