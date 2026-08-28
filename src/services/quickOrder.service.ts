@@ -25,6 +25,7 @@ export interface CreateOrderBody {
   items?:         OrderItemInput[];
   description?:   string;
   amount?:        unknown;
+  lessAmount?:    unknown;   // NEW: concession — reduces due, tracked separately
   advancePaid?:   unknown;
   paymentMethod?: string;
   entryDate?:     string;
@@ -123,12 +124,12 @@ export const quickOrderService = {
       const end   = new Date(d); end.setHours(23, 59, 59, 999);
       where.entryDate = { gte: start, lte: end };
     }
-    const rows = await prisma.quickOrder.groupBy({ by: ["customerId", "customerName", "customerPhone"], where, _sum: { amount: true, advancePaid: true }, _count: { id: true }, orderBy: { _sum: { amount: "desc" } } });
+    const rows = await prisma.quickOrder.groupBy({ by: ["customerId", "customerName", "customerPhone"], where, _sum: { amount: true, lessAmount: true, advancePaid: true }, _count: { id: true }, orderBy: { _sum: { amount: "desc" } } });
     const unbilled = await prisma.quickOrder.groupBy({ by: ["customerId", "customerName", "customerPhone"], where: { ...where, status: { not: "billed" } }, _count: { id: true } });
     const keyOf = (cid: string | null, name: string, phone: string) => `${cid || ""}|${name}|${phone || ""}`;
     const unbilledMap = new Map<string, number>();
     unbilled.forEach((u) => unbilledMap.set(keyOf(u.customerId, u.customerName, u.customerPhone), u._count.id));
-    return rows.map((r) => ({ customerId: r.customerId, customerName: r.customerName, customerPhone: r.customerPhone, totalOrders: r._count.id, unbilledCount: unbilledMap.get(keyOf(r.customerId, r.customerName, r.customerPhone)) || 0, totalAmount: Number(r._sum.amount ?? 0), totalAdvance: Number(r._sum.advancePaid ?? 0), totalDue: Math.max(0, Number(r._sum.amount ?? 0) - Number(r._sum.advancePaid ?? 0)) }));
+    return rows.map((r) => { const amt = Number(r._sum.amount ?? 0); const less = Number(r._sum.lessAmount ?? 0); const adv = Number(r._sum.advancePaid ?? 0); return { customerId: r.customerId, customerName: r.customerName, customerPhone: r.customerPhone, totalOrders: r._count.id, unbilledCount: unbilledMap.get(keyOf(r.customerId, r.customerName, r.customerPhone)) || 0, totalAmount: amt, totalLess: less, totalAdvance: adv, totalDue: Math.max(0, amt - less - adv) }; });
   },
 
   async searchCustomers(q: string, take = 8) {
@@ -165,6 +166,7 @@ export const quickOrderService = {
         items:         items as any,
         description:   body.description?.trim() || "",
         amount,
+        lessAmount:    toDecimal(body.lessAmount),
         advancePaid:   toDecimal(body.advancePaid),
         paymentMethod: body.paymentMethod === "online" ? "online" : "cash",
         entryDate:     body.entryDate ? new Date(body.entryDate) : new Date(),
@@ -218,6 +220,7 @@ export const quickOrderService = {
     if (body.entryDate     !== undefined) data.entryDate     = new Date(body.entryDate);
     if (body.items !== undefined) { const items = Array.isArray(body.items) ? body.items.map(cleanItem).filter((it) => it.desc) : []; data.items = items as any; }
     if (body.amount !== undefined) data.amount = toDecimal(body.amount);
+    if (body.lessAmount !== undefined) data.lessAmount = toDecimal(body.lessAmount);
     if (body.images !== undefined) data.images = body.images;
 
     const updated = await prisma.quickOrder.update({ where: { id }, data, include: withTask });

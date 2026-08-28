@@ -449,19 +449,20 @@ model QuickOrder {
   customerName  String
   customerPhone String        @default("")
   customerEmail String        @default("")
-  whatsapp      String?       // ── NEW: WhatsApp number (if different from phone)
+  whatsapp      String?
 
   // what the job is
-  title         String?       // ── NEW: short order label / title (optional)
+  title         String?
   workDetails   String        @default("")
   items         Json          @default("[]")
   description   String        @default("")
 
-  // reference images uploaded by admin (uploaded via /uploads/quick-orders/)
+  // reference images uploaded by admin
   images        String[]      @default([])
 
   // money
   amount        Decimal       @db.Decimal(12, 2)
+  lessAmount    Decimal       @default(0) @db.Decimal(12, 2)
   advancePaid   Decimal       @default(0) @db.Decimal(12, 2)
   paymentMethod PaymentMethod @default(cash)
 
@@ -488,10 +489,6 @@ model QuickOrder {
   @@index([customerId])
 }
 
-// ── QUICK ORDER PAYMENTS ─────────────────────────────────────────────
-// Append-only payment ledger for a Quick Order. Each cash/online
-// payment recorded by admin gets one row here. advancePaid on the
-// parent QuickOrder is always the SUM of these rows.
 model QuickOrderPayment {
   id        String        @id @default(cuid())
   order     QuickOrder    @relation("QuickOrderPayments", fields: [orderId], references: [id], onDelete: Cascade)

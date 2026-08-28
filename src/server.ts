@@ -57,9 +57,11 @@ app.set("trust proxy", true);
 // Serve uploaded task images (and any future uploads) as static files.
 // Files land at  backend/public/uploads/tasks/<filename>
 // and are served at  /uploads/tasks/<filename>  — same path taskRoutes writes.
+// process.cwd() always resolves to the backend root (C:\avijit-art\backend)
+// regardless of whether we're running ts-node/tsx (src/) or compiled JS (dist/).
 app.use(
   "/uploads",
-  express.static(path.join(__dirname, "..", "public", "uploads")),
+  express.static(path.join(process.cwd(), "public", "uploads")),
 );
 
 // ── Socket.IO setup ────────────────────────────────────────────────────────
