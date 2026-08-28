@@ -478,6 +478,8 @@ model QuickOrder {
   status        QuickOrderStatus @default(unbilled)
   invoiceId     String?
   invoiceNo     String?
+  quantity      String?
+  expectedDelivery DateTime?
   task          Task?         @relation("QuickOrderTask")
   payments      QuickOrderPayment[] @relation("QuickOrderPayments")
   createdBy     User?         @relation("QuickOrderCreated", fields: [createdById], references: [id], onDelete: SetNull)

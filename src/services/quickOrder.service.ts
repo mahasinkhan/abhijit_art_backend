@@ -15,24 +15,26 @@ export interface OrderItemInput {
 }
 export interface OrdersFilter { date?: string; customerId?: string; }
 export interface CreateOrderBody {
-  customerId?:    string | null;
-  customerName?:  string;
-  customerPhone?: string;
-  customerEmail?: string;
-  whatsapp?:      string;   // NEW
-  title?:         string;   // NEW
-  workDetails?:   string;
-  items?:         OrderItemInput[];
-  description?:   string;
-  amount?:        unknown;
-  lessAmount?:    unknown;   // NEW: concession — reduces due, tracked separately
-  advancePaid?:   unknown;
-  paymentMethod?: string;
-  entryDate?:     string;
-  assignToId?:    string;
-  priority?:      string;
-  deadline?:      string;
-  images?:        string[];  // uploaded file paths
+  customerId?:       string | null;
+  customerName?:     string;
+  customerPhone?:    string;
+  customerEmail?:    string;
+  whatsapp?:         string;
+  title?:            string;
+  workDetails?:      string;
+  quantity?:         string;
+  expectedDelivery?: string;
+  items?:            OrderItemInput[];
+  description?:      string;
+  amount?:           unknown;
+  lessAmount?:       unknown;
+  advancePaid?:      unknown;
+  paymentMethod?:    string;
+  entryDate?:        string;
+  assignToId?:       string;
+  priority?:         string;
+  deadline?:         string;
+  images?:           string[];
 }
 export interface UpdateOrderBody extends CreateOrderBody {}
 export interface AssignBody {
@@ -68,23 +70,27 @@ const withTask = {
 async function ensureCustomer(client: { name?: unknown; phone?: unknown; email?: unknown }) {
   try {
     const name  = String(client.name  ?? "").trim();
-    const phone = String(client.phone ?? "").trim();
+    const phone = normPhone(String(client.phone ?? ""));
     const email = String(client.email ?? "").trim().toLowerCase();
-    const np    = normPhone(phone);
-    if (!name && !np && !email) return;
-    let existing: null | { id: string } = null;
-    if (email && isEmail(email)) existing = await prisma.user.findUnique({ where: { email }, select: { id: true } });
-    if (!existing && np) {
-      const clients = await prisma.user.findMany({ where: { role: "client" }, select: { id: true, phone: true } });
-      const hit = clients.find((c) => normPhone(c.phone) && normPhone(c.phone) === np);
-      if (hit) existing = { id: hit.id };
+    if (!name && !phone) return;
+    // Check Customer table by phone first
+    if (phone) {
+      const existing = await prisma.customer.findUnique({ where: { phone }, select: { id: true } });
+      if (existing) return;
     }
-    if (existing) return;
-    const safeEmail = email && isEmail(email) ? email : `cust-${np || crypto.randomBytes(5).toString("hex")}@noemail.abhijitart`;
-    const clash = await prisma.user.findUnique({ where: { email: safeEmail }, select: { id: true } });
-    if (clash) return;
-    await prisma.user.create({ data: { name: name || "Walk-in customer", email: safeEmail, phone: phone || "", source: "offline" as any, notes: "Auto-added from Quick Orders", password: `nologin:${crypto.randomBytes(24).toString("hex")}` } });
-  } catch (e) { console.error("ensureCustomer failed:", e); }
+    // Create in Customer table (not User table)
+    await prisma.customer.create({
+      data: {
+        name: name || "Walk-in customer",
+        phone: phone || null,
+        email: email && isEmail(email) ? email : null,
+        source: "offline",
+      },
+    });
+  } catch (e) {
+    // P2002 = unique constraint (phone already exists) — safe to ignore
+    if ((e as any)?.code !== "P2002") console.error("ensureCustomer failed:", e);
+  }
 }
 
 async function businessBlock() {
@@ -156,37 +162,32 @@ export const quickOrderService = {
 
     const order = await prisma.quickOrder.create({
       data: {
-        customerId:    body.customerId?.trim() || null,
+        customerId:       body.customerId?.trim() || null,
         customerName,
-        customerPhone: body.customerPhone?.trim() || "",
-        customerEmail: body.customerEmail?.trim() || "",
-        whatsapp:      body.whatsapp?.trim()      || null,
-        title:         body.title?.trim()         || null,
+        customerPhone:    body.customerPhone?.trim() || "",
+        customerEmail:    body.customerEmail?.trim() || "",
+        whatsapp:         body.whatsapp?.trim()      || null,
+        title:            body.title?.trim()         || null,
         workDetails,
-        items:         items as any,
-        description:   body.description?.trim() || "",
+        quantity:         body.quantity?.trim()      || null,
+        expectedDelivery: body.expectedDelivery ? new Date(body.expectedDelivery) : null,
+        items:            items as any,
+        description:      body.description?.trim() || "",
         amount,
-        lessAmount:    toDecimal(body.lessAmount),
-        advancePaid:   toDecimal(body.advancePaid),
-        paymentMethod: body.paymentMethod === "online" ? "online" : "cash",
-        entryDate:     body.entryDate ? new Date(body.entryDate) : new Date(),
-        images:        body.images || [],
-        createdById:   userId,
+        lessAmount:       toDecimal(body.lessAmount),
+        advancePaid:      toDecimal(body.advancePaid),
+        paymentMethod:    body.paymentMethod === "online" ? "online" : "cash",
+        entryDate:        body.entryDate ? new Date(body.entryDate) : new Date(),
+        images:           body.images || [],
+        createdById:      userId,
       },
       include: withTask,
     });
 
-    // Save advance as first payment entry so it shows in Payment History
     const advance = toDecimal(body.advancePaid);
     if (advance > 0) {
       await prisma.quickOrderPayment.create({
-        data: {
-          orderId:     order.id,
-          amount:      advance,
-          method:      body.paymentMethod === "online" ? "online" : "cash",
-          note:        "Advance",
-          createdById: userId,
-        },
+        data: { orderId: order.id, amount: advance, method: body.paymentMethod === "online" ? "online" : "cash", note: "Advance", createdById: userId },
       });
     }
 
@@ -199,7 +200,7 @@ export const quickOrderService = {
     }
 
     const fresh = await prisma.quickOrder.findUnique({ where: { id: order.id }, include: withTask });
-    return { result: fresh, audit: { action: "quickorder.create", entityId: order.id, entityRef: order.customerName, summary: `New order for ${order.customerName} \u00b7 \u20b9${amount.toFixed(2)}${taskCreated ? " \u00b7 assigned" : ""}`, detail: { amount, itemCount: items.length, assigned: !!body.assignToId } } };
+    return { result: fresh, audit: { action: "quickorder.create", entityId: order.id, entityRef: order.customerName, summary: `New order for ${order.customerName} · ₹${amount.toFixed(2)}${taskCreated ? " · assigned" : ""}`, detail: { amount, itemCount: items.length, assigned: !!body.assignToId } } };
   },
 
   async updateOrder(id: string, body: UpdateOrderBody): Promise<Write<unknown>> {
@@ -213,18 +214,19 @@ export const quickOrderService = {
     if (body.customerEmail !== undefined) data.customerEmail = body.customerEmail?.trim() || "";
     if (body.whatsapp      !== undefined) data.whatsapp      = body.whatsapp?.trim()      || null;
     if (body.title         !== undefined) data.title         = body.title?.trim()         || null;
+    if (body.quantity      !== undefined) data.quantity      = body.quantity?.trim()      || null;
+    if (body.expectedDelivery !== undefined) data.expectedDelivery = body.expectedDelivery ? new Date(body.expectedDelivery) : null;
     if (body.workDetails   !== undefined) { const wd = String(body.workDetails).trim(); if (!wd) throw ApiError.badRequest("Work details cannot be empty."); data.workDetails = wd; }
     if (body.description   !== undefined) data.description   = body.description?.trim() || "";
     if (body.advancePaid   !== undefined) data.advancePaid   = toDecimal(body.advancePaid);
     if (body.paymentMethod !== undefined) data.paymentMethod = body.paymentMethod === "online" ? "online" : "cash";
     if (body.entryDate     !== undefined) data.entryDate     = new Date(body.entryDate);
     if (body.items !== undefined) { const items = Array.isArray(body.items) ? body.items.map(cleanItem).filter((it) => it.desc) : []; data.items = items as any; }
-    if (body.amount !== undefined) data.amount = toDecimal(body.amount);
+    if (body.amount     !== undefined) data.amount     = toDecimal(body.amount);
     if (body.lessAmount !== undefined) data.lessAmount = toDecimal(body.lessAmount);
-    if (body.images !== undefined) data.images = body.images;
+    if (body.images     !== undefined) data.images     = body.images;
 
     const updated = await prisma.quickOrder.update({ where: { id }, data, include: withTask });
-    // Sync images to linked task if it exists
     if (updated.task && data.images) {
       await prisma.task.update({ where: { id: updated.task.id }, data: { images: updated.images } });
     }
@@ -277,41 +279,17 @@ export const quickOrderService = {
     return { result: { ok: true }, audit: { action: "quickorder.delete", entityId: existing.id, entityRef: existing.customerName, summary: `Deleted order for ${existing.customerName}` } };
   },
 
-  /* ── record a payment ── */
   async recordPayment(id: string, body: { amount: unknown; method?: string; note?: string }, userId: string): Promise<Write<unknown>> {
     const order = await prisma.quickOrder.findUnique({ where: { id } });
     if (!order) throw ApiError.notFound("Order not found.");
     const n = parseFloat(String(body.amount ?? "0"));
     if (!n || n <= 0) throw ApiError.badRequest("Enter a valid payment amount.");
-
     const [payment] = await prisma.$transaction([
-      prisma.quickOrderPayment.create({
-        data: {
-          orderId:     id,
-          amount:      n,
-          method:      body.method === "online" ? "online" : "cash",
-          note:        String(body.note || "").trim(),
-          createdById: userId,
-        },
-        include: { createdBy: { select: { id: true, name: true } } },
-      }),
-      prisma.quickOrder.update({
-        where: { id },
-        data:  { advancePaid: { increment: n } },
-      }),
+      prisma.quickOrderPayment.create({ data: { orderId: id, amount: n, method: body.method === "online" ? "online" : "cash", note: String(body.note || "").trim(), createdById: userId }, include: { createdBy: { select: { id: true, name: true } } } }),
+      prisma.quickOrder.update({ where: { id }, data: { advancePaid: { increment: n } } }),
     ]);
-
     const fresh = await prisma.quickOrder.findUnique({ where: { id }, include: withTask });
-    return {
-      result: fresh,
-      audit: {
-        action:    "quickorder.payment",
-        entityId:  id,
-        entityRef: order.customerName,
-        summary:   `Payment of ₹${n.toFixed(2)} recorded for ${order.customerName}`,
-        detail:    { amount: n, method: body.method },
-      },
-    };
+    return { result: fresh, audit: { action: "quickorder.payment", entityId: id, entityRef: order.customerName, summary: `Payment of ₹${n.toFixed(2)} recorded for ${order.customerName}`, detail: { amount: n, method: body.method } } };
   },
 
   async convertToInvoice(id: string, userId: string): Promise<Write<{ invoice: unknown; invoiceNo: string; stock: InvoiceStockSync }>> {
@@ -335,7 +313,6 @@ export const quickOrderService = {
     await ensureCustomer({ name: entry.customerName, phone: entry.customerPhone, email: entry.customerEmail });
     let stock: InvoiceStockSync = { changed: false, movementCount: 0, items: [], warnings: [], unresolved: [] };
     try { stock = await inventoryService.applyInvoiceStock(invoice.id, userId); } catch (e) { console.error("applyInvoiceStock failed:", e); }
-
     return { result: { invoice, invoiceNo, stock }, audit: { action: "quickorder.convert", entityId: entry.id, entityRef: entry.customerName, summary: `Order to invoice ${invoiceNo} for ${entry.customerName}`, detail: { invoiceNo, subtotal, stockConsumed: stock.movementCount } } };
   },
 
@@ -371,7 +348,6 @@ export const quickOrderService = {
     await ensureCustomer({ name: first.customerName, phone: first.customerPhone, email: first.customerEmail });
     let stock: InvoiceStockSync = { changed: false, movementCount: 0, items: [], warnings: [], unresolved: [] };
     try { stock = await inventoryService.applyInvoiceStock(invoice.id, userId); } catch (e) { console.error("applyInvoiceStock combined failed:", e); }
-
     return { result: { invoice, invoiceNo, mergedCount: unbilled.length, stock }, audit: { action: "quickorder.convert.combined", entityId: invoice.id, entityRef: first.customerName, summary: `${unbilled.length} orders to invoice ${invoiceNo} for ${first.customerName}`, detail: { invoiceNo, mergedCount: unbilled.length, subtotal: totalAmount, stockConsumed: stock.movementCount } } };
   },
 };
