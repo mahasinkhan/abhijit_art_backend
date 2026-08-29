@@ -29,13 +29,12 @@ enum MediaType {
 enum StockUnit {
   piece
   sqft
+  sq_inch
+  inch
   metre
   roll
   sheet
-  litre
-  kg
   box
-  set
 }
 
 enum MovementType {
@@ -83,6 +82,25 @@ enum TaskPriority {
   urgent
 }
 
+enum ExpenseCategory {
+  salary
+  advance
+  rent
+  utilities
+  transport
+  materials
+  food
+  maintenance
+  marketing
+  other
+}
+
+/// Whether a payee is one of our own staff or an outside person/shop.
+enum PayeeKind {
+  employee
+  outsider
+}
+
 model User {
   id             String          @id @default(cuid())
   name           String
@@ -102,6 +120,8 @@ model User {
   quickOrderPayments QuickOrderPayment[] @relation("QuickOrderPaymentCreated")
   purchasesCreated SupplierPurchase[] @relation("PurchaseCreated")
   supplierPayments SupplierPayment[]  @relation("SupplierPaymentCreated")
+  payeeProfile     Payee?             @relation("PayeeUser")
+  expensesCreated  Expense[]          @relation("ExpenseCreatedBy")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   address String?
@@ -504,4 +524,61 @@ model QuickOrderPayment {
   createdById String?
   createdAt DateTime      @default(now())
   @@index([orderId, createdAt])
+}
+
+/// Anyone the shop pays money to — staff or outsider.
+/// PHONE IS THE IDENTITY: one phone number = one person, so every payment
+/// to that number groups under the same record no matter how the name was
+/// typed. An employee's Payee row links back to their User account.
+model Payee {
+  id     String    @id @default(cuid())
+  name   String
+  phone  String    @unique
+  kind   PayeeKind @default(outsider)
+
+  /// set only for staff — links the payee to their login account
+  user   User?   @relation("PayeeUser", fields: [userId], references: [id], onDelete: SetNull)
+  userId String? @unique
+
+  role   String  @default("")   // "Designer", "Driver", "Landlord"…
+  notes  String  @default("")
+  active Boolean @default(true)
+
+  expenses Expense[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([name])
+  @@index([kind])
+  @@index([active])
+}
+
+/// Daily expenses — every rupee that goes OUT of the shop.
+/// Always attached to a Payee, so "who got paid how much" is a plain join.
+model Expense {
+  id       String          @id @default(cuid())
+  date     DateTime        @default(now())
+  category ExpenseCategory @default(other)
+  title    String
+  amount   Decimal         @db.Decimal(12, 2)
+  method   PaymentMethod   @default(cash)
+
+  /// Restrict, not Cascade: a payee with payment history can't be wiped out
+  /// by accident — deactivate them instead.
+  payee   Payee  @relation(fields: [payeeId], references: [id], onDelete: Restrict)
+  payeeId String
+
+  notes String @default("")
+
+  createdBy   User?   @relation("ExpenseCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+  @@index([category])
+  @@index([payeeId, date])
+  @@index([method])
 }

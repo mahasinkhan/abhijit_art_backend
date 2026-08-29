@@ -28,6 +28,8 @@ import customerRoutes from "./routes/customerRoutes.js";
 import securityRoutes from "./routes/securityRoutes.js";
 import taskRoutes from "./routes/taskRoutes.js";
 import quickOrderRoutes from "./routes/quickOrderRoutes.js";
+import expenseRoutes from "./routes/expenseRoutes.js";
+import payeeRoutes from "./routes/payeeRoutes.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -112,6 +114,9 @@ app.use("/api/customers",     customerRoutes);
 app.use("/api/security",      securityRoutes);
 app.use("/api/tasks",         taskRoutes);
 app.use("/api/quick-orders",  quickOrderRoutes);
+// Daily expenses — money going OUT, always tied to a person in /api/payees
+app.use("/api/payees",        payeeRoutes);
+app.use("/api/expenses",      expenseRoutes);
 
 // ── Error handling (must come AFTER every route) ─────────────────────────────
 // Any request that matched no route above falls through to notFound; anything
