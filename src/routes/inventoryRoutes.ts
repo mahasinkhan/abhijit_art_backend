@@ -32,6 +32,7 @@ router.post("/items/:id/move", requirePin, asyncHandler(ctrl.moveStock));
 router.get("/summary", asyncHandler(ctrl.summary));
 router.get("/dashboard", asyncHandler(ctrl.dashboard));
 router.get("/categories", asyncHandler(ctrl.categories));
+router.patch("/categories/rename", asyncHandler(ctrl.renameCategory));
 router.get("/movements", asyncHandler(ctrl.movements));
 
 /* ── item prices (multi-supplier) ── */

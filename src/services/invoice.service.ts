@@ -2,8 +2,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Invoice domain logic — pure helpers, totals, status, stock sync, PDF build and
 // signed-URL generation. NO Express req/res, NO route wiring lives here (that
-// stays in the controller/routes). Everything below was lifted verbatim out of
-// invoiceRoutes.ts so behaviour is identical — this is a reorganisation only.
+// stays in the controller/routes).
 // ─────────────────────────────────────────────────────────────────────────────
 import fs from "node:fs";
 import path from "node:path";
@@ -42,7 +41,7 @@ export const fmtDate = (d: string) => {
 
 // ── types ────────────────────────────────────────────────────────────────────
 export type Party = { name?: string; address?: string; phone?: string; email?: string; gstin?: string; pan?: string };
-export type Line = { desc?: string; qty?: unknown; rate?: unknown; itemId?: unknown };
+export type Line = { desc?: string; qty?: unknown; rate?: unknown; itemId?: unknown; width?: unknown; height?: unknown; unit?: unknown };
 
 export const asSource = (v: unknown, fallback: "online" | "offline"): "online" | "offline" =>
   v === "online" ? "online" : v === "offline" ? "offline" : fallback;
@@ -51,11 +50,16 @@ export const asMethod = (v: unknown, fallback: "cash" | "online"): "cash" | "onl
   v === "cash" ? "cash" : v === "online" ? "online" : fallback;
 
 export const mapLine = (it: Line) => {
-  const line: { desc: string; qty: number; rate: number; itemId?: string } = {
+  const line: { desc: string; qty: number; rate: number; itemId?: string; width?: number; height?: number; unit?: string } = {
     desc: str(it.desc), qty: num(it.qty), rate: num(it.rate),
   };
   const itemId = str(it.itemId);
   if (itemId) line.itemId = itemId;
+  const w = num(it.width), h = num(it.height);
+  if (w > 0) line.width = w;
+  if (h > 0) line.height = h;
+  const unit = str(it.unit);
+  if (unit) line.unit = unit;
   return line;
 };
 

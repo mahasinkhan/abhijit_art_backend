@@ -364,8 +364,7 @@ export const inventoryService = {
       },
     });
   },
-
-  async dashboard(filter: DashboardFilter) {
+    async dashboard(filter: DashboardFilter) {
     const now  = new Date();
     const gran = asGran(filter.granularity);
     const def  = defaultRange(gran, now);
@@ -567,7 +566,6 @@ export const inventoryService = {
       debit: number; credit: number; ref?: string; note?: string; method?: string; itemCount?: number; balance?: number;
     };
 
-    // Merge purchases + payments, sort newest-first
     const entries: Entry[] = [
       ...purchases.map((p): Entry => ({
         kind: "purchase", id: p.id, date: p.billDate, createdAt: p.createdAt,
@@ -584,8 +582,6 @@ export const inventoryService = {
       })
       .slice(0, lim);
 
-    // ── FIXED: build running balance oldest→newest, then display stays newest-first ──
-    // Reverse to get oldest-first, accumulate balance, entries[] keeps newest-first order.
     const entriesAsc = [...entries].reverse();
     let runBal = 0;
     for (const e of entriesAsc) {
@@ -796,6 +792,21 @@ export const inventoryService = {
     if (unresolved.length) console.warn(`[stock] ${invoice.invoiceNo}: ${unresolved.length} item(s) could not be restocked`);
     return summarizeStockSync(affected, false, unresolved);
   },
+
+  async renameCategory(oldName: string, newName: string): Promise<{ ok: true; updated: number }> {
+    if (!oldName.trim() || !newName.trim()) throw ApiError.badRequest("Both oldName and newName are required.");
+    if (oldName.trim() === newName.trim()) throw ApiError.badRequest("New name is the same as the old name.");
+    const existing = await prisma.inventoryItem.count({
+      where: { category: { equals: newName.trim(), mode: "insensitive" } },
+    });
+    if (existing > 0) throw ApiError.conflict(`Category "${newName.trim()}" already exists.`);
+    const result = await prisma.inventoryItem.updateMany({
+      where: { category: { equals: oldName.trim(), mode: "insensitive" } },
+      data:  { category: newName.trim() },
+    });
+    return { ok: true, updated: result.count };
+  },
+
 };
 
 export type InventoryService = typeof inventoryService;

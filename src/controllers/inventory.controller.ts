@@ -78,6 +78,17 @@ export const inventoryController = {
     res.json(await inventoryService.categories());
   },
 
+  renameCategory: async (req: Request, res: Response) => {
+    const { oldName, newName } = req.body;
+    if (!oldName || !newName) {
+      res.status(400).json({ error: "oldName and newName are required" });
+      return;
+    }
+    const result = await inventoryService.renameCategory(String(oldName), String(newName));
+    await logAudit({ req, entity: "inventory", action: "rename_category", summary: `Renamed category "${oldName}" → "${newName}"`, detail: `${oldName} → ${newName}` });
+    res.json(result);
+  },
+
   movements: async (req: Request, res: Response) => {
     res.json(await inventoryService.movements(Number(req.query.limit) || 50));
   },
