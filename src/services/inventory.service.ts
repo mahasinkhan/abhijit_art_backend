@@ -44,7 +44,7 @@ const MOVE_LABEL: Record<string, string> = {
   opening: "Opening", purchase: "Purchase", consumption: "Consumption",
   wastage: "Wastage", returned: "Return", adjustment: "Adjustment",
 };
-const STOCK_UNITS = ["piece", "sqft", "Square Inch", "inch", "metre", "roll", "sheet", "box"];
+const STOCK_UNITS = ["piece", "sqft", "Square Inch", "inch", "feet", "metre", "roll", "sheet", "box"];
 const TX_OPTS = { maxWait: 15_000, timeout: 30_000 } as const;
 
 const toNum = (v: unknown): number | null => {
