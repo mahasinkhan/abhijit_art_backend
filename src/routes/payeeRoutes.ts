@@ -1,4 +1,5 @@
 // backend/src/routes/payeeRoutes.ts
+// The people directory behind the cash book — staff and outsiders alike.
 import { Router } from "express";
 import { prisma } from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.js";
@@ -6,7 +7,7 @@ import { protect, adminOnly } from "../middleware/auth.js";
 const router = Router();
 router.use(protect, adminOnly);
 
-const num = (v: any) => Number(v ?? 0);
+const num    = (v: any) => Number(v ?? 0);
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /**
@@ -23,24 +24,27 @@ export function normalisePhone(raw: any): string {
 
 const asKind = (v: any) => (v === "employee" ? "employee" : "outsider");
 
-/** Attaches paid-total and last-paid to a payee row. */
+/** Rolls a payee's entries into paid / received / balance. */
 function withTotals(p: any) {
-  const expenses = p.expenses || [];
-  const total = round2(expenses.reduce((s: number, e: any) => s + num(e.amount), 0));
-  const last  = expenses.length
-    ? expenses.reduce((a: any, b: any) => (new Date(a.date) > new Date(b.date) ? a : b))
+  const rows = p.expenses || [];
+  const paid     = round2(rows.filter((e: any) => e.kind === "expense").reduce((s: number, e: any) => s + num(e.amount), 0));
+  const received = round2(rows.filter((e: any) => e.kind === "income").reduce((s: number, e: any) => s + num(e.amount), 0));
+  const last = rows.length
+    ? rows.reduce((a: any, b: any) => (new Date(a.date) > new Date(b.date) ? a : b))
     : null;
   const { expenses: _drop, ...rest } = p;
   return {
     ...rest,
-    totalPaid:  total,
-    paymentCount: expenses.length,
-    lastPaidAt: last?.date || null,
+    paid,
+    received,
+    /** positive = they still owe us, negative = we owe them */
+    net: round2(paid - received),
+    entryCount: rows.length,
+    lastEntryAt: last?.date || null,
   };
 }
 
 /* ───────────────────────── list ───────────────────────── */
-// GET /api/payees?kind=&search=&includeInactive=1
 router.get("/", async (req, res) => {
   try {
     const { kind, search, includeInactive } = req.query as Record<string, string>;
@@ -60,13 +64,14 @@ router.get("/", async (req, res) => {
     const rows = await prisma.payee.findMany({
       where,
       include: {
-        expenses: { select: { amount: true, date: true } },
+        expenses: { select: { amount: true, date: true, kind: true } },
         user:     { select: { id: true, name: true, email: true, role: true } },
       },
       orderBy: { name: "asc" },
     });
 
-    const shaped = rows.map(withTotals).sort((a, b) => b.totalPaid - a.totalPaid);
+    const shaped = rows.map(withTotals)
+      .sort((a, b) => (b.paid + b.received) - (a.paid + a.received));
     res.json(shaped);
   } catch (err) {
     console.error("payees list", err);
@@ -75,9 +80,6 @@ router.get("/", async (req, res) => {
 });
 
 /* ─────────── pull employees into the people list ─────────── */
-// POST /api/payees/sync-employees
-// Creates a Payee for every employee that has a phone number and isn't
-// linked yet. Employees without a phone are reported back, not guessed at.
 router.post("/sync-employees", async (_req, res) => {
   try {
     const employees = await prisma.user.findMany({
@@ -92,12 +94,11 @@ router.post("/sync-employees", async (_req, res) => {
       const phone = normalisePhone(emp.phone);
       if (!phone) { skipped.push(emp.name); continue; }
 
-      const existingByUser  = await prisma.payee.findUnique({ where: { userId: emp.id } });
+      const existingByUser = await prisma.payee.findUnique({ where: { userId: emp.id } });
       if (existingByUser) continue;
 
       const existingByPhone = await prisma.payee.findUnique({ where: { phone } });
       if (existingByPhone) {
-        // same number already in the book — attach the login to it
         await prisma.payee.update({
           where: { id: existingByPhone.id },
           data: { userId: emp.id, kind: "employee", name: existingByPhone.name || emp.name },
@@ -118,8 +119,7 @@ router.post("/sync-employees", async (_req, res) => {
   }
 });
 
-/* ───────────────────── one person + history ───────────────────── */
-// GET /api/payees/:id?from=&to=
+/* ───────────────── one person + full history ───────────────── */
 router.get("/:id", async (req, res) => {
   try {
     const { from, to } = req.query as Record<string, string>;
@@ -136,40 +136,47 @@ router.get("/:id", async (req, res) => {
     });
     if (!payee) return res.status(404).json({ error: "Person not found" });
 
-    const expenses = await prisma.expense.findMany({
+    const entries = await prisma.expense.findMany({
       where, orderBy: [{ date: "desc" }, { createdAt: "desc" }],
     });
 
-    const total  = round2(expenses.reduce((s, e) => s + num(e.amount), 0));
-    const cash   = round2(expenses.filter((e) => e.method === "cash").reduce((s, e) => s + num(e.amount), 0));
+    const outRows = entries.filter((e) => e.kind === "expense");
+    const inRows  = entries.filter((e) => e.kind === "income");
+    const sum = (l: any[]) => round2(l.reduce((s, e) => s + num(e.amount), 0));
+
+    const paid     = sum(outRows);
+    const received = sum(inRows);
 
     // month-by-month, newest first — reads like a passbook
-    const monthMap = new Map<string, number>();
-    expenses.forEach((e) => {
+    const monthMap = new Map<string, { month: string; income: number; expense: number }>();
+    entries.forEach((e) => {
       const k = new Date(e.date).toISOString().slice(0, 7);
-      monthMap.set(k, round2((monthMap.get(k) || 0) + num(e.amount)));
+      if (!monthMap.has(k)) monthMap.set(k, { month: k, income: 0, expense: 0 });
+      const m = monthMap.get(k)!;
+      if (e.kind === "income") m.income  = round2(m.income + num(e.amount));
+      else                     m.expense = round2(m.expense + num(e.amount));
     });
 
-    // category split for this person
-    const catMap = new Map<string, number>();
-    expenses.forEach((e) => {
-      catMap.set(e.category, round2((catMap.get(e.category) || 0) + num(e.amount)));
+    const catMap = new Map<string, { category: string; kind: string; amount: number }>();
+    entries.forEach((e) => {
+      const key = `${e.kind}:${e.category}`;
+      if (!catMap.has(key)) catMap.set(key, { category: e.category as string, kind: e.kind as string, amount: 0 });
+      const c = catMap.get(key)!;
+      c.amount = round2(c.amount + num(e.amount));
     });
 
     res.json({
       ...payee,
-      totalPaid: total,
-      cash,
-      online: round2(total - cash),
-      paymentCount: expenses.length,
-      lastPaidAt: expenses[0]?.date || null,
-      expenses: expenses.map((e) => ({ ...e, amount: num(e.amount) })),
-      byMonth: Array.from(monthMap.entries())
-        .map(([month, amount]) => ({ month, amount }))
-        .sort((a, b) => b.month.localeCompare(a.month)),
-      byCategory: Array.from(catMap.entries())
-        .map(([category, amount]) => ({ category, amount }))
-        .sort((a, b) => b.amount - a.amount),
+      paid,
+      received,
+      net: round2(paid - received),
+      cashPaid:   sum(outRows.filter((e) => e.method === "cash")),
+      onlinePaid: sum(outRows.filter((e) => e.method === "online")),
+      entryCount: entries.length,
+      lastEntryAt: entries[0]?.date || null,
+      entries: entries.map((e) => ({ ...e, amount: num(e.amount) })),
+      byMonth: Array.from(monthMap.values()).sort((a, b) => b.month.localeCompare(a.month)),
+      byCategory: Array.from(catMap.values()).sort((a, b) => b.amount - a.amount),
     });
   } catch (err) {
     console.error("payee get", err);
@@ -178,7 +185,6 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ───────────────────────── create ───────────────────────── */
-// POST /api/payees  { name, phone, kind, userId?, role?, notes? }
 router.post("/", async (req, res) => {
   try {
     const { name, phone, kind, userId, role, notes } = req.body || {};
@@ -193,7 +199,7 @@ router.post("/", async (req, res) => {
     if (clash) {
       return res.status(409).json({
         error: `${clash.name} already uses this number`,
-        payee: clash,           // frontend can just select this one instead
+        payee: clash,
       });
     }
 
@@ -218,7 +224,7 @@ router.post("/", async (req, res) => {
       include: { user: { select: { id: true, name: true, email: true, role: true } } },
     });
 
-    res.status(201).json({ ...row, totalPaid: 0, paymentCount: 0, lastPaidAt: null });
+    res.status(201).json({ ...row, paid: 0, received: 0, net: 0, entryCount: 0, lastEntryAt: null });
   } catch (err) {
     console.error("payee create", err);
     res.status(500).json({ error: "Failed to save this person" });
@@ -247,7 +253,6 @@ router.patch("/:id", async (req, res) => {
       }
       data.phone = digits;
     }
-    // a linked employee stays an employee
     if (kind !== undefined && !existing.userId) data.kind = asKind(kind);
     if (role   !== undefined) data.role   = String(role || "").trim();
     if (notes  !== undefined) data.notes  = String(notes || "").trim();
@@ -257,7 +262,7 @@ router.patch("/:id", async (req, res) => {
       where: { id: req.params.id },
       data,
       include: {
-        expenses: { select: { amount: true, date: true } },
+        expenses: { select: { amount: true, date: true, kind: true } },
         user:     { select: { id: true, name: true, email: true, role: true } },
       },
     });
@@ -270,13 +275,12 @@ router.patch("/:id", async (req, res) => {
 });
 
 /* ───────────────────────── delete ───────────────────────── */
-// Only possible while they have no payment history — otherwise deactivate.
 router.delete("/:id", async (req, res) => {
   try {
     const count = await prisma.expense.count({ where: { payeeId: req.params.id } });
     if (count > 0) {
       return res.status(409).json({
-        error: `This person has ${count} payment${count === 1 ? "" : "s"} on record. Mark them inactive instead of deleting.`,
+        error: `This person has ${count} entr${count === 1 ? "y" : "ies"} on record. Mark them inactive instead of deleting.`,
       });
     }
     await prisma.payee.delete({ where: { id: req.params.id } });

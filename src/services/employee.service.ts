@@ -3,11 +3,19 @@ import bcrypt from "bcryptjs";
 import type { Prisma } from "@prisma/client";
 import { prisma } from "../config/prisma.js";
 
-const isEmail = (v: string) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(v);
-const str     = (v: unknown) => String(v ?? "").trim();
+const str = (v: unknown) => String(v ?? "").trim();
+// keep only digits, last 10 — same rule the Customer model uses, so phone
+// identity is consistent across the app.
+const cleanPhone = (v: unknown) => str(v).replace(/\D/g, "").slice(-10);
+// synthetic email so the required + unique `email` column never breaks now
+// that employees have no email field. Username is unique (case-insensitive),
+// so this address is unique too. It's internal only — never shown or used.
+const staffEmail = (username: string) => `${username.toLowerCase()}@staff.abhijitart`;
+
+const err = (message: string, status: number) => Object.assign(new Error(message), { status });
 
 const employeeSelect = {
-  id: true, name: true, email: true, phone: true,
+  id: true, name: true, phone: true, username: true,
   role: true, createdAt: true,
   _count: { select: { tasksAssigned: true } },
 } satisfies Prisma.UserSelect;
@@ -23,31 +31,37 @@ export const employeeService = {
   },
 
   async create(body: {
-    name?: unknown; email?: unknown; phone?: unknown; password?: unknown;
+    name?: unknown; username?: unknown; phone?: unknown; password?: unknown;
   }) {
     const name     = str(body.name);
-    const email    = str(body.email).toLowerCase();
-    const phone    = str(body.phone);
+    const username = str(body.username);
+    const phone    = cleanPhone(body.phone);
     const password = str(body.password);
 
-    if (!name || !email || !password)
-      throw Object.assign(new Error("name, email and password are required"), { status: 400 });
-    if (password.length < 6)
-      throw Object.assign(new Error("Password must be at least 6 characters"), { status: 400 });
-    if (!isEmail(email))
-      throw Object.assign(new Error("That email doesn't look right."), { status: 400 });
+    if (!name)     throw err("Full name is required.", 400);
+    if (!phone)    throw err("Phone number is required.", 400);
+    if (!username) throw err("Username is required.", 400);
+    if (!password) throw err("Password is required.", 400);
+    if (password.length < 6) throw err("Password must be at least 6 characters.", 400);
 
-    const existing = await prisma.user.findUnique({ where: { email } });
-    if (existing)
-      throw Object.assign(new Error("An account with this email already exists."), { status: 409 });
+    // phone unique across ALL users (it's an identity field now)
+    const phoneClash = await prisma.user.findFirst({ where: { phone } });
+    if (phoneClash) throw err("A user with this phone number already exists.", 409);
+
+    // username unique, case-insensitive (so EMP001 and emp001 are the same)
+    const userClash = await prisma.user.findFirst({
+      where: { username: { equals: username, mode: "insensitive" } },
+    });
+    if (userClash) throw err("That username is already taken.", 409);
 
     const hashed = await bcrypt.hash(password, 10);
 
     return prisma.user.create({
       data: {
         name,
-        email,
-        phone:    phone || "",
+        username,
+        email:    staffEmail(username),
+        phone,
         password: hashed,
         role:     "employee",
         source:   "offline" as any,
@@ -57,21 +71,43 @@ export const employeeService = {
   },
 
   async update(id: string, body: {
-    name?: unknown; phone?: unknown; password?: unknown;
+    name?: unknown; username?: unknown; phone?: unknown; password?: unknown;
   }) {
     const existing = await prisma.user.findUnique({ where: { id } });
     if (!existing || existing.role !== "employee")
-      throw Object.assign(new Error("Employee not found."), { status: 404 });
+      throw err("Employee not found.", 404);
 
     const data: Prisma.UserUpdateInput = {};
 
-    if (body.name  !== undefined) data.name  = str(body.name);
-    if (body.phone !== undefined) data.phone = str(body.phone);
+    if (body.name !== undefined) {
+      const name = str(body.name);
+      if (!name) throw err("Full name is required.", 400);
+      data.name = name;
+    }
+
+    if (body.phone !== undefined) {
+      const phone = cleanPhone(body.phone);
+      if (!phone) throw err("Phone number is required.", 400);
+      const clash = await prisma.user.findFirst({ where: { phone, NOT: { id } } });
+      if (clash) throw err("A user with this phone number already exists.", 409);
+      data.phone = phone;
+    }
+
+    if (body.username !== undefined) {
+      const username = str(body.username);
+      if (!username) throw err("Username is required.", 400);
+      const clash = await prisma.user.findFirst({
+        where: { username: { equals: username, mode: "insensitive" }, NOT: { id } },
+      });
+      if (clash) throw err("That username is already taken.", 409);
+      data.username = username;
+      // keep the internal email in sync so it stays unique + tidy
+      data.email = staffEmail(username);
+    }
 
     if (body.password !== undefined && str(body.password)) {
       const pw = str(body.password);
-      if (pw.length < 6)
-        throw Object.assign(new Error("Password must be at least 6 characters"), { status: 400 });
+      if (pw.length < 6) throw err("Password must be at least 6 characters.", 400);
       data.password = await bcrypt.hash(pw, 10);
     }
 
@@ -85,7 +121,7 @@ export const employeeService = {
   async remove(id: string) {
     const existing = await prisma.user.findUnique({ where: { id } });
     if (!existing || existing.role !== "employee")
-      throw Object.assign(new Error("Employee not found."), { status: 404 });
+      throw err("Employee not found.", 404);
 
     await prisma.task.deleteMany({ where: { assignedToId: id } });
     await prisma.user.delete({ where: { id } });

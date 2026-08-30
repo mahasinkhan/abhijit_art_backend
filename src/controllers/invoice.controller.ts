@@ -351,6 +351,10 @@ export async function saveInvoice(req: Request, res: Response) {
       business: {
         name: str(biz.name), address: str(biz.address), phone: str(biz.phone),
         email: str(biz.email), gstin: str(biz.gstin), pan: str(biz.pan),
+        // print format flag from the Billing page ("half" = Billing 50%, else full).
+        // Kept in the business JSON snapshot so the Invoices-tab Print button can
+        // reprint each bill in the exact layout it was created in.
+        format: (biz as any).format === "half" ? "half" : "full",
       },
       items: lines.map(mapLine),
       discType: (inv.discType === "percent" ? "percent" : "amount") as "amount" | "percent",

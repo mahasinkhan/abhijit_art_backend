@@ -11,14 +11,14 @@ const makeToken = (user: User) =>
   jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET as string, { expiresIn: "7d" });
 
 const publicUser = (u: User) => ({
-  id: u.id, name: u.name, email: u.email, phone: u.phone, role: u.role,
+  id: u.id, name: u.name, email: u.email, phone: u.phone, role: u.role, username: u.username,
 });
 
 // ✅ Auth middleware
 const authMiddleware = (req: Request, res: Response, next: NextFunction) => {
   const token = req.headers.authorization?.split(" ")[1];
   if (!token) return res.status(401).json({ message: "No token provided" });
-  
+
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET as string) as { id: string };
     (req as any).userId = decoded.id;
@@ -47,11 +47,27 @@ router.post("/register", async (req: Request, res: Response) => {
 
 router.post("/login", async (req: Request, res: Response) => {
   try {
-    const { email, password } = req.body;
-    const user = await prisma.user.findUnique({ where: { email: (email || "").toLowerCase() } });
-    if (!user) return res.status(400).json({ message: "Invalid email or password" });
+    // accept email (admins/clients) OR username (employees, e.g. EMP001).
+    // The frontend sends whatever was typed in the `email` field.
+    const idRaw = String(req.body.email ?? req.body.username ?? req.body.identifier ?? "").trim();
+    const password = req.body.password;
+    if (!idRaw || !password)
+      return res.status(400).json({ message: "Enter your login and password" });
+
+    const lower = idRaw.toLowerCase();
+    const user = await prisma.user.findFirst({
+      where: {
+        OR: [
+          { email: lower },
+          { username: { equals: idRaw, mode: "insensitive" } },
+        ],
+      },
+    });
+    if (!user) return res.status(400).json({ message: "Invalid login or password" });
+
     const ok = await bcrypt.compare(password, user.password);
-    if (!ok) return res.status(400).json({ message: "Invalid email or password" });
+    if (!ok) return res.status(400).json({ message: "Invalid login or password" });
+
     res.json({ token: makeToken(user), user: publicUser(user) });
   } catch {
     res.status(500).json({ message: "Server error" });
