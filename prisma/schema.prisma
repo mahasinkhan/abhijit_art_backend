@@ -102,6 +102,7 @@ enum TxnCategory {
   loan_back
   refund
   other_income
+  outside
 }
 
 enum TxnKind {

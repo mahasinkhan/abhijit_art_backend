@@ -10,7 +10,7 @@ const router = Router();
 router.use(protect, adminOnly);
 
 const EXPENSE_CATS = [
-  "salary", "advance", "lent", "rent", "utilities",
+  "salary", "outside", "advance", "lent", "rent", "utilities",
   "transport", "materials", "food", "maintenance", "marketing", "other",
 ] as const;
 
@@ -54,7 +54,7 @@ const include = {
 const shape = (e: any) => ({ ...e, amount: num(e.amount) });
 
 /* ───────────────────────── list ───────────────────────── */
-// GET /api/expenses?from=&to=&kind=&category=&method=&search=&payeeId=
+// GET /api/income-expense?from=&to=&kind=&category=&method=&search=&payeeId=
 router.get("/", async (req, res) => {
   try {
     const { from, to } = readRange(req.query);
@@ -178,7 +178,7 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ───────────────────────── create ───────────────────────── */
-// POST /api/expenses  { kind, date?, category, title, amount, method, payeeId?, notes? }
+// POST /api/income-expense  { kind, date?, category, title, amount, method, payeeId?, notes? }
 router.post("/", async (req: any, res) => {
   try {
     const { kind, date, category, title, amount, method, payeeId, notes } = req.body || {};
@@ -190,7 +190,7 @@ router.post("/", async (req: any, res) => {
 
     const cat = asCategory(category, k);
 
-    // lending and getting money back are always about a person
+    // lending, salary and getting money back are always about a person
     const needsPayee = cat === "lent" || cat === "loan_back" || cat === "salary" || cat === "advance";
     if (needsPayee && !payeeId) {
       return res.status(400).json({ error: "Choose the person this entry belongs to" });
