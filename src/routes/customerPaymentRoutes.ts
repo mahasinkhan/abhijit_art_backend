@@ -41,14 +41,14 @@ async function pinError(req: any): Promise<{ code: number; message: string } | n
   return null;
 }
 
-/** Today's date from the picker → store the exact current instant, so the
- *  recorded time is real (e.g. 1:47 pm, not a placeholder). A back-dated day
- *  → store noon UTC so it can never shift to the day before/after in any TZ. */
+/** Store the payment on the chosen day (or today if none), fixed at noon IST.
+ *  We keep DATE only — no clock time — because the statement/history show just
+ *  the date. Noon-IST as the instant means it never shifts to the previous or
+ *  next day in any server timezone (UTC included). */
 function paidAtFrom(input: any): Date {
-  const s = String(input || "").slice(0, 10);
-  const todayIST = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }); // YYYY-MM-DD
-  if (!s || s === todayIST) return new Date();          // today — keep the real time
-  return new Date(`${s}T12:00:00.000Z`);                // back-dated — noon, no day shift
+  const todayIST = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" });
+  const day = String(input || "").slice(0, 10) || todayIST;   // default: today
+  return new Date(`${day}T06:30:00.000Z`);   // noon IST
 }
 
 /** Every invoice belonging to this customer — linked by id, or by phone for
