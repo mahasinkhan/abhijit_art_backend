@@ -16,6 +16,10 @@ router.get("/:id/pdf", invoice.getPublicPdf);
 // ── everything below requires an admin session ──
 router.use(protect, adminOnly);
 
+// Next available invoice number (server decides from the DB, so it's always
+// unique). MUST be declared before "/:id" or Express treats "next-number" as an id.
+router.get("/next-number", invoice.nextInvoiceNumber);
+
 router.post("/email", invoice.emailInvoice);
 router.post("/", invoice.saveInvoice);
 router.get("/", invoice.listInvoices);

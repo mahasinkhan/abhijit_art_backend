@@ -834,3 +834,38 @@ export async function deleteInvoice(req: Request, res: Response) {
     res.status(500).json({ message: (err as Error).message || "Couldn't delete the invoice." });
   }
 }
+
+
+/* ── GET /next-number — server-decided next invoice number ──
+   The frontend asks the server for the next number so it's ALWAYS unique —
+   even across devices, browsers or a cleared localStorage. We take today's
+   stamp, find the highest AA-YYMMDD-NNN already in the DB for today, and
+   return the next one. The DB is the single source of truth; the unique
+   constraint on invoiceNo (plus saveInvoice's 409 on a clash) is the final
+   guard if two people bill at the same instant. */
+export async function nextInvoiceNumber(_req: Request, res: Response) {
+  try {
+        // Always the IST calendar date, so the counter rolls over at midnight IST
+    // no matter what timezone the server runs in (UTC on most hosts). en-CA
+    // gives YYYY-MM-DD; slice+strip → YYMMDD.
+    const stamp = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Kolkata" }).slice(2).replace(/-/g, "");
+    const prefix = `AA-${stamp}-`;
+
+    const todays = await prisma.invoice.findMany({
+      where: { invoiceNo: { startsWith: prefix } },
+      select: { invoiceNo: true },
+    });
+
+    let maxSeq = 0;
+    for (const row of todays) {
+      const m = row.invoiceNo.match(/-(\d+)$/);
+      if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10) || 0);
+    }
+
+    const next = `${prefix}${String(maxSeq + 1).padStart(3, "0")}`;
+    res.json({ invoiceNo: next });
+  } catch (err) {
+    console.error("next invoice number failed:", err);
+    res.status(500).json({ message: "Couldn't get the next invoice number." });
+  }
+}
