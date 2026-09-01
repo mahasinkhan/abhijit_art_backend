@@ -25,6 +25,7 @@ import userRoutes from "./routes/userRoutes.js";
 import inventoryRoutes from "./routes/inventoryRoutes.js";
 import invoiceRoutes from "./routes/invoiceRoutes.js";
 import customerRoutes from "./routes/customerRoutes.js";
+import customerPaymentRoutes from "./routes/customerPaymentRoutes.js";
 import securityRoutes from "./routes/securityRoutes.js";
 import taskRoutes from "./routes/taskRoutes.js";
 import quickOrderRoutes from "./routes/quickOrderRoutes.js";
@@ -111,6 +112,9 @@ app.use("/api/users",         userRoutes);
 app.use("/api/inventory",     inventoryRoutes);
 app.use("/api/invoices",      invoiceRoutes);
 app.use("/api/customers",     customerRoutes);
+// Account-level customer payments — one running tab per customer, not
+// bill-by-bill settling. Allocation across invoices is computed on read.
+app.use("/api/customer-payments", customerPaymentRoutes);
 app.use("/api/security",      securityRoutes);
 app.use("/api/tasks",         taskRoutes);
 app.use("/api/quick-orders",  quickOrderRoutes);

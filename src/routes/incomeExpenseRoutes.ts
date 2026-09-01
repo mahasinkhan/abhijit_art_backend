@@ -35,14 +35,49 @@ function asCategory(v: any, kind: Kind): Category {
   return kind === "income" ? "other_income" : "other";
 }
 
-function dayStart(d: Date) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
-function dayEnd(d: Date)   { const x = new Date(d); x.setHours(23, 59, 59, 999); return x; }
+// ── Timezone-safe day handling ──────────────────────────────────────────
+// All entry dates are stored at UTC-noon of the calendar day, so the day
+// never shifts regardless of the server's timezone (Render runs in UTC).
+const YMD = /^\d{4}-\d{2}-\d{2}/;
 
-/** ?from / ?to as YYYY-MM-DD. Defaults to the current month. */
+/** A "YYYY-MM-DD" (or ISO) string / Date → that calendar day at 12:00 UTC. */
+function dayNoonUTC(input?: any): Date {
+  let y: number, m: number, d: number;
+  if (typeof input === "string" && YMD.test(input)) {
+    [y, m, d] = input.slice(0, 10).split("-").map(Number);
+  } else {
+    const dt = input ? new Date(input) : new Date();
+    y = dt.getFullYear(); m = dt.getMonth() + 1; d = dt.getDate();
+  }
+  return new Date(Date.UTC(y, m - 1, d, 12, 0, 0, 0));
+}
+
+/** Start (00:00 UTC) of the calendar day for a range boundary. */
+function dayStartUTC(input?: any): Date {
+  const n = dayNoonUTC(input);
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), 0, 0, 0, 0));
+}
+
+/** End (23:59:59.999 UTC) of the calendar day for a range boundary. */
+function dayEndUTC(input?: any): Date {
+  const n = dayNoonUTC(input);
+  return new Date(Date.UTC(n.getUTCFullYear(), n.getUTCMonth(), n.getUTCDate(), 23, 59, 59, 999));
+}
+
+/** Today's calendar day in IST (business runs in India) → its UTC start/end. */
+function istTodayBounds() {
+  const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000); // shift to IST wall-clock
+  const y = nowIst.getUTCFullYear(), m = nowIst.getUTCMonth(), d = nowIst.getUTCDate();
+  return {
+    start: new Date(Date.UTC(y, m, d, 0, 0, 0, 0)),
+    end:   new Date(Date.UTC(y, m, d, 23, 59, 59, 999)),
+  };
+}
+
+/** ?from / ?to as YYYY-MM-DD. Defaults to the current month (UTC-safe). */
 function readRange(q: any) {
-  const now  = new Date();
-  const from = q.from ? dayStart(new Date(q.from)) : dayStart(new Date(now.getFullYear(), now.getMonth(), 1));
-  const to   = q.to   ? dayEnd(new Date(q.to))     : dayEnd(now);
+  const from = q.from ? dayStartUTC(q.from) : dayStartUTC(new Date(new Date().getFullYear(), new Date().getMonth(), 1));
+  const to   = q.to   ? dayEndUTC(q.to)     : dayEndUTC(new Date());
   return { from, to };
 }
 
@@ -90,11 +125,11 @@ router.get("/", async (req, res) => {
 router.get("/summary", async (req, res) => {
   try {
     const { from, to } = readRange(req.query);
-    const now = new Date();
+    const today = istTodayBounds();
 
     const [rows, todayRows] = await Promise.all([
       prisma.expense.findMany({ where: { date: { gte: from, lte: to } }, include }),
-      prisma.expense.findMany({ where: { date: { gte: dayStart(now), lte: dayEnd(now) } } }),
+      prisma.expense.findMany({ where: { date: { gte: today.start, lte: today.end } } }),
     ]);
 
     const sum = (list: any[]) => round2(list.reduce((s, r) => s + num(r.amount), 0));
@@ -132,10 +167,10 @@ router.get("/summary", async (req, res) => {
       e.count += 1;
     });
 
-    // day-by-day, both directions
+    // day-by-day, both directions (label by IST calendar day)
     const dayMap = new Map<string, { date: string; income: number; expense: number }>();
     rows.forEach((r) => {
-      const k = new Date(r.date).toISOString().slice(0, 10);
+      const k = new Date(new Date(r.date).getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
       if (!dayMap.has(k)) dayMap.set(k, { date: k, income: 0, expense: 0 });
       const d = dayMap.get(k)!;
       if (r.kind === "income") d.income  = round2(d.income + num(r.amount));
@@ -206,7 +241,7 @@ router.post("/", async (req: any, res) => {
     const row = await prisma.expense.create({
       data: {
         kind: k,
-        date: date ? new Date(date) : new Date(),
+        date: dayNoonUTC(date),
         category: cat,
         title: String(title).trim(),
         amount: amt,
@@ -242,7 +277,7 @@ router.patch("/:id", async (req, res) => {
       data.category = asCategory(category ?? existing.category, k);
     }
 
-    if (date !== undefined)   data.date   = new Date(date);
+    if (date !== undefined)   data.date   = dayNoonUTC(date);
     if (method !== undefined) data.method = asMethod(method);
     if (notes !== undefined)  data.notes  = String(notes || "").trim();
 

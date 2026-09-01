@@ -11,8 +11,8 @@ import { buildInvoicePdf, pdfHasRupeeGlyph, invoiceLogoPath } from "../utils/inv
 import { prisma } from "../config/prisma.js";
 import { isPinSet, verifyPin, logAudit } from "../utils/security.js";
 import {
-  str, num, round2, clamp, isEmail, escapeHtml, escapeLines, rupee, fmtDate,
-  asSource, asMethod, mapLine, countLinked, computeTotals,
+    str, num, round2, clamp, isEmail, escapeHtml, escapeLines, rupee, fmtDate,
+  asSource, asMethod, mapLine, countLinked, computeTotals, upsertCustomer,
   defaultReminderNote, reminderLogoPath, withPayments, recomputeInvoice,
   applyStockSafely, reverseStockSafely, buildInvoicePdfFromRecord,
   pdfSigValid, invoicePdfUrl,
@@ -339,15 +339,16 @@ export async function saveInvoice(req: Request, res: Response) {
     const createdById = (req as any).user?.id ?? null;
     const existing = await prisma.invoice.findUnique({ where: { invoiceNo } });
     const source = asSource(inv.source, existing?.source ?? "offline");
-
+    const customerId = await upsertCustomer(client, source);
     const content = {
       date,
       clientName: str(client.name) || "—",
       clientPhone: str(client.phone) || null,
       clientEmail: str(client.email) || null,
       clientGstin: str(client.gstin) || null,
-      clientAddr: str(client.address) || null,
+            clientAddr: str(client.address) || null,
       source,
+      customerId,
       business: {
         name: str(biz.name), address: str(biz.address), phone: str(biz.phone),
         email: str(biz.email), gstin: str(biz.gstin), pan: str(biz.pan),
@@ -378,7 +379,16 @@ export async function saveInvoice(req: Request, res: Response) {
       return res.status(200).json({ ...synced, pdfUrl: invoicePdfUrl(req, existing.id), stock });
     }
 
-    const created = await prisma.invoice.create({ data: { invoiceNo, ...content, createdById } });
+        const created = await prisma.invoice.create({ data: { invoiceNo, ...content, createdById } });
+
+    // VERIFY the row is really in the DB before telling the client it saved.
+    // If this re-read comes back empty, throw instead of returning a false
+    // success — so the frontend shows an error and the user knows to retry.
+    const confirm = await prisma.invoice.findUnique({ where: { id: created.id }, select: { id: true } });
+    if (!confirm) {
+      console.error(`❌ Invoice ${invoiceNo} created but not found on re-read`);
+      return res.status(500).json({ message: "The invoice didn't save. Please try again." });
+    }
 
     const advance = clamp(num(inv.paidAmount), 0, total);
     if (advance > 0.005) {
@@ -410,8 +420,11 @@ export async function saveInvoice(req: Request, res: Response) {
     await logStockAudit(req, "deduct", invoiceNo, created.id, stock);
 
     res.status(201).json({ ...synced, pdfUrl: invoicePdfUrl(req, created.id), stock });
-  } catch (err) {
+    } catch (err) {
     console.error("Invoice save failed:", err);
+    if ((err as { code?: string }).code === "P2002") {
+      return res.status(409).json({ message: `Invoice number "${str((req.body as any)?.invNo)}" already exists. Change the number and save again.` });
+    }
     res.status(500).json({ message: (err as Error).message || "Couldn't save the invoice." });
   }
 }
