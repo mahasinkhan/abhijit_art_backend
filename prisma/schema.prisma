@@ -29,6 +29,9 @@ enum MediaType {
 enum StockUnit {
   piece
   sqft
+  Square_Inch @map("Square Inch")
+  inch
+  feet
   metre
   roll
   sheet
