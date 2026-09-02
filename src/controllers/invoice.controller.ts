@@ -96,7 +96,7 @@ export async function emailInvoice(req: Request, res: Response) {
     const inv = (req.body.invoice || {}) as {
       invNo?: string; date?: string; biz?: Party; client?: Party;
       items?: Line[]; discType?: string; discVal?: unknown; taxPct?: unknown;
-      notes?: string; warranty?: string; paidAmount?: unknown;
+      notes?: string; warranty?: string; paidAmount?: unknown; purpose?: string;
     };
 
     if (!to) return res.status(400).json({ message: "Recipient email is required." });
@@ -106,6 +106,7 @@ export async function emailInvoice(req: Request, res: Response) {
     const biz: Party = inv.biz || {};
     const client: Party = inv.client || {};
     const bizName = str(biz.name) || "Abhijit Art";
+    const purpose = str(inv.purpose);
 
     const lines = (Array.isArray(inv.items) ? inv.items : []).filter(
       (it) => str(it.desc) || num(it.rate) > 0,
@@ -201,6 +202,7 @@ export async function emailInvoice(req: Request, res: Response) {
                 ${client.email ? `<br/>✉ ${escapeHtml(client.email)}` : ""}
                 ${client.gstin ? `<br/>GSTIN: ${escapeHtml(client.gstin)}` : ""}
               </div>
+              ${purpose ? `<div style="margin-top:10px;font-size:12px;color:#8a8f9a"><b style="color:#d9542f;letter-spacing:.6px;text-transform:uppercase;font-size:10.5px">Purpose</b> &nbsp;<span style="color:#1f2430;font-weight:700;font-size:13px">${escapeHtml(purpose)}</span></div>` : ""}
             </td></tr>
             <tr><td style="padding:22px 28px 0">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse">
@@ -243,7 +245,8 @@ export async function emailInvoice(req: Request, res: Response) {
     const text =
       (message ? message + "\n\n" : "") +
       `INVOICE ${str(inv.invNo)}\nDate: ${fmtDate(str(inv.date))}\n\n` +
-      `Bill to: ${str(client.name) || "—"}\n\n` +
+      `Bill to: ${str(client.name) || "—"}\n` +
+      (purpose ? `Purpose: ${purpose}\n` : "") + `\n` +
       lines.map((it, i) => `${i + 1}. ${str(it.desc) || "—"} — ${num(it.qty)} x ${rupee(num(it.rate))} = ${rupee(num(it.qty) * num(it.rate))}`).join("\n") +
       `\n\nSubtotal: ${rupee(subtotal)}` +
       (discountAmt > 0 ? `\nDiscount: -${rupee(discountAmt)}` : "") +
@@ -314,7 +317,7 @@ export async function saveInvoice(req: Request, res: Response) {
       invNo?: string; date?: string; biz?: Party; client?: Party;
       items?: Line[]; discType?: string; discVal?: unknown; taxPct?: unknown;
       notes?: string; warranty?: string; paidAmount?: unknown; source?: unknown;
-      paymentMethod?: unknown;
+      paymentMethod?: unknown; purpose?: string;
     };
 
     const invoiceNo = str(inv.invNo);
@@ -347,6 +350,8 @@ export async function saveInvoice(req: Request, res: Response) {
       clientEmail: str(client.email) || null,
       clientGstin: str(client.gstin) || null,
             clientAddr: str(client.address) || null,
+      // short free-text note shown on the bill under Bill To (e.g. "School Banner Work")
+      purpose: str(inv.purpose) || null,
       source,
       customerId,
       business: {
@@ -415,7 +420,7 @@ export async function saveInvoice(req: Request, res: Response) {
       req, action: "invoice.create", entityId: created.id, entityRef: invoiceNo,
       summary: `Created invoice ${invoiceNo} for ${content.clientName} — ${rupee(total)}` +
         (advance > 0 ? ` (advance ${rupee(advance)} ${asMethod(inv.paymentMethod, "cash")})` : ""),
-      detail: { total, advance, method: advance > 0 ? asMethod(inv.paymentMethod, "cash") : null },
+      detail: { total, advance, method: advance > 0 ? asMethod(inv.paymentMethod, "cash") : null, purpose: content.purpose },
     });
     await logStockAudit(req, "deduct", invoiceNo, created.id, stock);
 
@@ -432,8 +437,22 @@ export async function saveInvoice(req: Request, res: Response) {
 /* ── GET / — list all ── */
 export async function listInvoices(req: Request, res: Response) {
   try {
-    const invoices = await prisma.invoice.findMany({ orderBy: { createdAt: "desc" }, include: withPayments });
-    res.json(invoices.map((inv) => ({ ...inv, pdfUrl: invoicePdfUrl(req, inv.id) })));
+    const invoices = await prisma.invoice.findMany({
+      orderBy: { createdAt: "desc" },
+      include: { ...withPayments, customer: { select: { email: true, phone: true } } },
+    });
+    // contactEmail/contactPhone = where to actually reach this client TODAY.
+    // The Customer record wins because it is the live, editable one — the
+    // clientEmail/clientPhone on the bill is a historical snapshot frozen at
+    // billing time, so editing a customer's number must change who gets the
+    // reminder without rewriting old invoices. The snapshot is the fallback
+    // for bills that were never linked to a customer.
+    res.json(invoices.map((inv) => ({
+      ...inv,
+      contactEmail: inv.customer?.email || inv.clientEmail || null,
+      contactPhone: inv.customer?.phone || inv.clientPhone || null,
+      pdfUrl: invoicePdfUrl(req, inv.id),
+    })));
   } catch (err) {
     console.error("Invoice list failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't load invoices." });
@@ -444,9 +463,17 @@ export async function listInvoices(req: Request, res: Response) {
 export async function getInvoice(req: Request, res: Response) {
   try {
     const id = str(req.params.id);
-    const invoice = await prisma.invoice.findUnique({ where: { id }, include: withPayments });
+    const invoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: { ...withPayments, customer: { select: { email: true, phone: true } } },
+    });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
-    res.json({ ...invoice, pdfUrl: invoicePdfUrl(req, invoice.id) });
+    res.json({
+      ...invoice,
+      contactEmail: invoice.customer?.email || invoice.clientEmail || null,
+      contactPhone: invoice.customer?.phone || invoice.clientPhone || null,
+      pdfUrl: invoicePdfUrl(req, invoice.id),
+    });
   } catch (err) {
     console.error("Invoice fetch failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't load the invoice." });
@@ -483,7 +510,12 @@ export async function remindInvoice(req: Request, res: Response) {
   try {
     const id = str(req.params.id);
     const channel: "email" | "whatsapp" = req.body?.channel === "whatsapp" ? "whatsapp" : "email";
-    const invoice = await prisma.invoice.findUnique({ where: { id }, include: withPayments });
+    // the linked Customer record is loaded too, so a bill saved without an
+    // email can still be reminded using the address on the customer profile
+    const invoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: { ...withPayments, customer: { select: { email: true, phone: true } } },
+    });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
     if (invoice.status === "paid") return res.status(400).json({ message: "This invoice is already fully paid." });
     if (invoice.status === "cancelled") return res.status(400).json({ message: "This invoice is cancelled — reactivate it before reminding." });
@@ -497,8 +529,8 @@ export async function remindInvoice(req: Request, res: Response) {
     const note = str(req.body?.message) || defaultReminderNote(invoice);
 
     if (channel === "email") {
-      const to = str(invoice.clientEmail).toLowerCase();
-      if (!to) return res.status(400).json({ message: "No email on file for this client — use WhatsApp instead." });
+      const to = str((invoice as any).customer?.email || invoice.clientEmail).toLowerCase();
+      if (!to) return res.status(400).json({ message: "No email on file for this client — add one on their Customers record, or use WhatsApp instead." });
       if (!isEmail(to)) return res.status(400).json({ message: "The client's email on file doesn't look right." });
 
       const biz = (invoice.business || {}) as Party;
@@ -510,6 +542,7 @@ export async function remindInvoice(req: Request, res: Response) {
       const safeNo = invoice.invoiceNo.replace(/[^\w.-]+/g, "-") || "invoice";
       const site = siteUrl();
       const showSite = /^https?:\/\//i.test(site) && !/localhost|127\.0\.0\.1/i.test(site);
+      const purpose = str((invoice as any).purpose);
 
       const noteHtml = note.split(/\n\s*\n/).map((p) => `<p style="margin:0 0 14px;font-size:15px;line-height:1.65;color:#2a231d">${escapeHtml(p).replace(/\n/g, "<br/>")}</p>`).join("");
       const logoHtml = reminderLogoPath
@@ -526,6 +559,7 @@ export async function remindInvoice(req: Request, res: Response) {
               <tr><td style="padding:30px 30px 0">
                 <div style="font-size:11px;letter-spacing:2.4px;text-transform:uppercase;color:#c2974a;font-weight:700">Payment reminder</div>
                 <div style="font-family:Georgia,'Times New Roman',serif;font-size:21px;font-weight:700;color:#2a231d;margin-top:6px;letter-spacing:-.2px">Invoice ${escapeHtml(invoice.invoiceNo)}</div>
+                ${purpose ? `<div style="font-size:12.5px;color:#6f6357;margin-top:5px">${escapeHtml(purpose)}</div>` : ""}
               </td></tr>
               <tr><td style="padding:16px 30px 0">${noteHtml}</td></tr>
               <tr><td style="padding:6px 30px 0">
@@ -562,7 +596,8 @@ export async function remindInvoice(req: Request, res: Response) {
 
       const text =
         note + "\n\n" +
-        `AMOUNT DUE: ${rupee(balance)}\nInvoice total: ${rupee(total)}  ·  Received: ${rupee(paid)}\nInvoice ${invoice.invoiceNo}  ·  ${dateStr}\n\n` +
+        `AMOUNT DUE: ${rupee(balance)}\nInvoice total: ${rupee(total)}  ·  Received: ${rupee(paid)}\nInvoice ${invoice.invoiceNo}  ·  ${dateStr}\n` +
+        (purpose ? `Purpose: ${purpose}\n` : "") + `\n` +
         `The full invoice is attached as a PDF.\n\n${bizName}\n${bizAddress || "Berhampore, West Bengal"}` +
         (bizPhone ? `\n${bizPhone}` : "") + (bizEmail ? `\n${bizEmail}` : "");
 
@@ -592,16 +627,27 @@ export async function remindInvoice(req: Request, res: Response) {
     const updated = await prisma.invoice.update({
       where: { id },
       data: { lastRemindedAt: new Date(), reminderCount: { increment: 1 } },
-      include: withPayments,
+      include: { ...withPayments, customer: { select: { email: true, phone: true } } },
     });
 
     await logAudit({
       req, action: "invoice.remind", entityId: invoice.id, entityRef: invoice.invoiceNo,
       summary: `Reminder sent via ${channel} for ${invoice.invoiceNo} — balance ${rupee(balance)}`,
-      detail: { channel, balance, to: channel === "email" ? invoice.clientEmail : invoice.clientPhone, reminderCount: updated.reminderCount },
+      detail: {
+        channel, balance,
+        to: channel === "email"
+          ? ((invoice as any).customer?.email || invoice.clientEmail || null)
+          : ((invoice as any).customer?.phone || invoice.clientPhone || null),
+        reminderCount: updated.reminderCount,
+      },
     });
 
-    res.json({ ...updated, pdfUrl: invoicePdfUrl(req, updated.id) });
+    res.json({
+      ...updated,
+      contactEmail: updated.customer?.email || updated.clientEmail || null,
+      contactPhone: updated.customer?.phone || updated.clientPhone || null,
+      pdfUrl: invoicePdfUrl(req, updated.id),
+    });
   } catch (err) {
     if ((err as { code?: string }).code === "P2025") return res.status(404).json({ message: "Invoice not found." });
     console.error("Invoice reminder failed:", err);
@@ -624,7 +670,7 @@ export async function editInvoice(req: Request, res: Response) {
     if (invoice.status === "paid") return res.status(403).json({ message: "This invoice is paid and locked. Delete and recreate it to make a correction." });
     if (invoice.status === "cancelled") return res.status(403).json({ message: "This invoice is cancelled. Reactivate it (record a payment) before editing." });
 
-    const body = (req.body || {}) as { date?: string; client?: Party; items?: Line[]; discType?: string; discVal?: unknown; taxPct?: unknown; notes?: string; warranty?: string; source?: unknown; };
+    const body = (req.body || {}) as { date?: string; client?: Party; items?: Line[]; discType?: string; discVal?: unknown; taxPct?: unknown; notes?: string; warranty?: string; source?: unknown; purpose?: string; };
     const client: Party = body.client || {};
     const actorId = (req as any).user?.id ?? null;
 
@@ -649,6 +695,7 @@ export async function editInvoice(req: Request, res: Response) {
         clientEmail: str(client.email) || null,
         clientGstin: str(client.gstin) || null,
         clientAddr: str(client.address) || null,
+        purpose: str(body.purpose) || null,
         // itemId preserved so the fresh deduction below (and any later
         // cancel/delete restock) still sees the inventory links
         items: lines.map(mapLine),

@@ -388,6 +388,8 @@ model Invoice {
   clientEmail String?
   clientGstin String?
   clientAddr  String?
+  /// short free-text note shown on the bill under Bill To — e.g. "School Banner Work"
+  purpose     String?
   customerId  String?
   customer    Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
   source      CustomerSource @default(offline)

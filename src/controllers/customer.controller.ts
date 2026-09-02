@@ -5,6 +5,9 @@ import { Prisma } from "@prisma/client";
 import { transporter, mailFrom } from "../config/mailer.js";
 
 const str = (v: unknown) => String(v ?? "").trim();
+const esc = (s: unknown) =>
+  String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] as string));
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
 type InvoiceStat = { total: Prisma.Decimal | number; paidAmount: Prisma.Decimal | number; status: string };
 
@@ -23,7 +26,12 @@ function computeStats(invoices: InvoiceStat[]) {
 export async function listCustomers(req: Request, res: Response) {
   try {
     const q      = str(req.query.q);
-    const source = str(req.query.source) as "online" | "offline" | "";
+    const raw    = str(req.query.source);
+    // the UI's dropdown says "From billing" / "Walk-in", which map onto the
+    // CustomerSource enum online|offline. Accept both spellings.
+    const source =
+      raw === "billing" || raw === "online"  ? "online"  :
+      raw === "walkin"  || raw === "offline" ? "offline" : "";
 
     const where: Prisma.CustomerWhereInput = {};
     if (q) {
@@ -33,8 +41,8 @@ export async function listCustomers(req: Request, res: Response) {
         { email: { contains: q, mode: "insensitive" } },
       ];
     }
-    if (source === "online" || source === "offline") {
-      where.source = source;
+    if (source) {
+      where.source = source as "online" | "offline";
     }
 
     const customers = await prisma.customer.findMany({
@@ -162,68 +170,107 @@ export async function deleteCustomer(req: Request, res: Response) {
   }
 }
 
-/* ── POST /email ── bulk email with HTML template + token replacement ── */
+/* ── POST /email ── bulk email with HTML template + token replacement ──
+   Body keys accepted (the UI sends the first of each pair; the second spelling
+   is kept so any older caller keeps working):
+     customerIds | ids
+     body        | message
+     ctaLabel    | buttonText
+     ctaUrl      | buttonLink
+   Response is shaped for the UI's send report: { sent, skipped, failed, total,
+   results:[{ ok, id, name, email, error? }] }. */
 export async function emailCustomers(req: Request, res: Response) {
   try {
-    const { ids, subject, message } = req.body || {};
+    const b = req.body || {};
+    const ids: unknown = b.customerIds ?? b.ids ?? b.userIds;
+    const subject  = str(b.subject);
+    const message  = str(b.body ?? b.message);
+    const ctaLabel = str(b.ctaLabel ?? b.buttonText);
+    const ctaUrlIn = str(b.ctaUrl   ?? b.buttonLink);
+    // only allow real absolute links in the button
+    const ctaUrl = /^https?:\/\//i.test(ctaUrlIn) ? ctaUrlIn : "";
+
     if (!Array.isArray(ids) || !ids.length)
-      return res.status(400).json({ message: "No customer IDs provided." });
-    if (!str(subject)) return res.status(400).json({ message: "Subject is required." });
-    if (!str(message)) return res.status(400).json({ message: "Message is required." });
+      return res.status(400).json({ message: "No customer IDs provided.", error: "No customer IDs provided." });
+    if (!subject) return res.status(400).json({ message: "Subject is required.", error: "Subject is required." });
+    if (!message) return res.status(400).json({ message: "Message is required.", error: "Message is required." });
 
     const customers = await prisma.customer.findMany({
-      where: { id: { in: ids } },
+      where: { id: { in: ids as string[] } },
       select: { id: true, name: true, email: true },
     });
 
-    const results: { id: string; name: string; email: string | null; status: "sent" | "skipped" | "failed"; reason?: string }[] = [];
+    type Row = {
+      ok: boolean; id: string; name: string; email: string | null;
+      error?: string;
+      // legacy fields, kept so an older caller reading these still works
+      status: "sent" | "skipped" | "failed"; reason?: string;
+    };
+    const results: Row[] = [];
 
     for (const c of customers) {
       if (!c.email) {
-        results.push({ id: c.id, name: c.name, email: null, status: "skipped", reason: "No email on file" });
+        results.push({ ok: false, id: c.id, name: c.name, email: null, error: "No email on file", status: "skipped", reason: "No email on file" });
         continue;
       }
 
-      // Token replacement: {{name}}, {{first_name}}
+      // Token replacement: {{name}}, {{first_name}} (whitespace inside the
+      // braces is allowed, because the templates in the UI write {{first_name}}
+      // but a hand-typed one may read {{ first_name }})
       const firstName = c.name.split(/\s+/)[0] || c.name;
-      const body = str(message)
-        .replace(/\{\{name\}\}/gi, c.name)
-        .replace(/\{\{first_name\}\}/gi, firstName);
+      const fill = (s: string) => s
+        .replace(/\{\{\s*first_name\s*\}\}/gi, firstName)
+        .replace(/\{\{\s*name\s*\}\}/gi, c.name);
+
+      const body = fill(message);
+      const subj = fill(subject);
+
+      const paras = body.split(/\n\s*\n/).map(p =>
+        `<p style="margin:0 0 14px;font-size:15px;line-height:1.65;color:#1f2430">${esc(p).replace(/\n/g, "<br/>")}</p>`
+      ).join("");
+
+      const button = ctaLabel && ctaUrl
+        ? `<tr><td style="padding:4px 28px 26px">
+             <a href="${esc(ctaUrl)}" style="display:inline-block;padding:13px 26px;background:#d9542f;color:#ffffff;font-size:14px;font-weight:700;text-decoration:none">${esc(ctaLabel)}</a>
+           </td></tr>`
+        : "";
 
       const html = `<!doctype html><html><body style="margin:0;padding:0;background:#f5f6f8;font-family:'DM Sans',Arial,sans-serif">
         <table width="100%" cellpadding="0" cellspacing="0" style="background:#f5f6f8;padding:28px 12px">
           <tr><td align="center">
             <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#fff;border:1px solid #f0e6dc">
-              <tr><td style="padding:28px 28px 0">
-                <div style="font-size:21px;font-weight:800;color:#d9542f;letter-spacing:-0.4px">Abhijit Art</div>
+              <tr><td style="background:#2a231d;padding:20px 28px">
+                <div style="font-size:20px;font-weight:800;color:#ffffff;letter-spacing:-0.3px">Abhijit Art</div>
+                <div style="font-size:10px;font-weight:700;letter-spacing:1.1px;text-transform:uppercase;color:#c2974a;margin-top:4px">Printing &amp; Design Studio</div>
               </td></tr>
-              <tr><td style="padding:20px 28px">
-                ${body.split(/\n\s*\n/).map(p =>
-                  `<p style="margin:0 0 14px;font-size:15px;line-height:1.65;color:#1f2430">${
-                    p.replace(/\n/g, "<br/>")
-                  }</p>`
-                ).join("")}
+              <tr><td style="height:4px;line-height:4px;font-size:0;background:#d9542f">&nbsp;</td></tr>
+              <tr><td style="padding:24px 28px 4px">
+                <div style="font-size:17px;font-weight:800;color:#1f2430;margin-bottom:14px">${esc(subj)}</div>
+                ${paras}
               </td></tr>
+              ${button}
               <tr><td style="padding:18px 28px;border-top:1px solid #f0e6dc;background:#fffcf9">
-                <div style="font-size:12px;color:#8a8f9a">Abhijit Art · Berhampore, West Bengal</div>
+                <div style="font-size:12px;color:#8a8f9a;line-height:1.6">Abhijit Art · Berhampore, West Bengal<br/>7405179066 · abhijitart85@gmail.com</div>
               </td></tr>
             </table>
           </td></tr>
         </table>
       </body></html>`;
 
+      const text = body + (ctaLabel && ctaUrl ? `\n\n${ctaLabel}: ${ctaUrl}` : "") + `\n\nAbhijit Art · Berhampore, West Bengal`;
+
       try {
-        await transporter.sendMail({
-          from: mailFrom(),
-          to: c.email,
-          subject: str(subject).replace(/\{\{name\}\}/gi, c.name).replace(/\{\{first_name\}\}/gi, firstName),
-          html,
-          text: body,
-        });
-        results.push({ id: c.id, name: c.name, email: c.email, status: "sent" });
+        await transporter.sendMail({ from: mailFrom(), to: c.email, subject: subj, html, text });
+        results.push({ ok: true, id: c.id, name: c.name, email: c.email, status: "sent" });
+        console.log(`✉️  sent → ${c.email}`);
       } catch (e) {
-        results.push({ id: c.id, name: c.name, email: c.email, status: "failed", reason: (e as Error).message });
+        const msg = (e as Error).message || "Send failed";
+        results.push({ ok: false, id: c.id, name: c.name, email: c.email, error: msg, status: "failed", reason: msg });
+        console.error(`✉️  FAILED → ${c.email}: ${msg}`);
       }
+
+      // Gmail throttles bursts — space the sends out a little.
+      await sleep(400);
     }
 
     const sent    = results.filter(r => r.status === "sent").length;
@@ -231,9 +278,9 @@ export async function emailCustomers(req: Request, res: Response) {
     const failed  = results.filter(r => r.status === "failed").length;
 
     console.log(`📧 bulk email: ${sent} sent, ${skipped} skipped, ${failed} failed`);
-    res.json({ sent, skipped, failed, results });
+    res.json({ sent, skipped, failed, total: results.length, results });
   } catch (err) {
     console.error("Customer email failed:", err);
-    res.status(500).json({ message: "Couldn't send emails." });
+    res.status(500).json({ message: "Couldn't send emails.", error: (err as Error).message });
   }
 }
