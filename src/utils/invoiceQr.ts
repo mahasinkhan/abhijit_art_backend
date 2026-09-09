@@ -5,8 +5,8 @@
 // unlike embedding a bitmap.
 import QRCode from "qrcode";
 
-/** ⚠️ FILL THIS IN — must match the frontend's UPI_ID. */
-export const UPI_ID   = process.env.UPI_ID || "REPLACE_WITH_UPI_ID";
+/** Falls back to the studio's own UPI address when the env vars are unset. */
+export const UPI_ID   = process.env.UPI_ID   || "9932913826@okbizaxis";
 export const UPI_NAME = process.env.UPI_NAME || "Abhijit Art";
 
 export const upiConfigured = Boolean(UPI_ID) && !UPI_ID.startsWith("REPLACE_");
@@ -22,11 +22,19 @@ export function upiPayload(amount?: number, note?: string): string {
  *  to the bitmap instead of leaving a blank square on the invoice. */
 export function drawUpiQr(doc: any, payload: string, x: number, y: number, size: number): boolean {
   try {
-    const qr = QRCode.create(payload, { errorCorrectionLevel: "M" });
-    const n = qr.modules.size;
-    const data = qr.modules.data;
-    const cell = size / n;
+    // QRCode.create is the only sync API that exposes the raw module grid.
+    // Under ESM the package's shape varies between builds — the named export
+    // works locally but can arrive wrapped in .default once bundled — so both
+    // are checked before giving up.
+    const api: any = (QRCode as any)?.create ? QRCode : (QRCode as any)?.default;
+    if (!api?.create) throw new Error("qrcode.create unavailable");
 
+    const qr = api.create(payload, { errorCorrectionLevel: "M" });
+    const n: number = qr?.modules?.size;
+    const data: ArrayLike<number> = qr?.modules?.data;
+    if (!n || !data) throw new Error("empty module grid");
+
+    const cell = size / n;
     doc.save().fillColor("#000000");
     for (let r = 0; r < n; r++) {
       for (let c = 0; c < n; c++) {
