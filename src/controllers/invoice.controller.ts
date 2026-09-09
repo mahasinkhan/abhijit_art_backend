@@ -12,7 +12,7 @@ import { prisma } from "../config/prisma.js";
 import { isPinSet, verifyPin, logAudit } from "../utils/security.js";
 import {
     str, num, round2, clamp, isEmail, escapeHtml, escapeLines, rupee, fmtDate,
-  asSource, asMethod, mapLine, countLinked, computeTotals, upsertCustomer,
+  asSource, asMethod, mapLine, pdfLine, countLinked, computeTotals, upsertCustomer,
   defaultReminderNote, reminderLogoPath, withPayments, recomputeInvoice,
   applyStockSafely, reverseStockSafely, buildInvoicePdfFromRecord,
   pdfSigValid, invoicePdfUrl,
@@ -261,8 +261,9 @@ export async function emailInvoice(req: Request, res: Response) {
     const discountLabel = `Discount${inv.discType === "percent" ? ` (${discVal}%)` : ""}`;
     const pdf = await buildInvoicePdf({
       invNo: str(inv.invNo), date: fmtDate(str(inv.date)), biz, client,
-      lines: lines.map((it) => ({ desc: str(it.desc), qty: num(it.qty), rate: num(it.rate) })),
-      subtotal, discountAmt, discountLabel, taxAmt, taxLabel: `GST (${taxPct}%)`,
+      purpose,
+      lines: lines.map(pdfLine),
+      subtotal, discountAmt, discountLabel, taxAmt, taxLabel: `GST (${taxPct}%)`, taxPct,
       total, paidAmount, notes: str(inv.notes), warranty: str(inv.warranty), siteUrl: site,
     });
 

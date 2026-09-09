@@ -39,9 +39,16 @@ export const fmtDate = (d: string) => {
   return dt.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric" });
 };
 
+/** HH:MM:SS, matching the time printed under the date on the paper copy. */
+export const fmtTime = (d: string) => {
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return "";
+  return dt.toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+};
+
 // ── types ────────────────────────────────────────────────────────────────────
 export type Party = { name?: string; address?: string; phone?: string; email?: string; gstin?: string; pan?: string };
-export type Line = { desc?: string; qty?: unknown; rate?: unknown; itemId?: unknown; width?: unknown; height?: unknown; unit?: unknown };
+export type Line = { desc?: string; qty?: unknown; rate?: unknown; itemId?: unknown; width?: unknown; height?: unknown; unit?: unknown; pcs?: unknown };
 
 export const asSource = (v: unknown, fallback: "online" | "offline"): "online" | "offline" =>
   v === "online" ? "online" : v === "offline" ? "offline" : fallback;
@@ -50,7 +57,7 @@ export const asMethod = (v: unknown, fallback: "cash" | "online"): "cash" | "onl
   v === "cash" ? "cash" : v === "online" ? "online" : fallback;
 
 export const mapLine = (it: Line) => {
-  const line: { desc: string; qty: number; rate: number; itemId?: string; width?: number; height?: number; unit?: string } = {
+  const line: { desc: string; qty: number; rate: number; itemId?: string; width?: number; height?: number; unit?: string; pcs?: number } = {
     desc: str(it.desc), qty: num(it.qty), rate: num(it.rate),
   };
   const itemId = str(it.itemId);
@@ -60,10 +67,30 @@ export const mapLine = (it: Line) => {
   if (h > 0) line.height = h;
   const unit = str(it.unit);
   if (unit) line.unit = unit;
+  const pcs = num(it.pcs);
+  if (pcs > 0) line.pcs = pcs;
   return line;
 };
 
 export const countLinked = (lines: Line[]) => lines.filter((it) => str(it.itemId)).length;
+
+/** "3 × 2" when the line was measured, blank for countable items — the same
+ *  label the printed invoice shows in its Size column. */
+export const sizeLabel = (it: Line) => {
+  const w = num(it.width), h = num(it.height);
+  return w > 0 && h > 0 ? `${w} × ${h}` : "";
+};
+
+/** Maps a stored/incoming line into the shape buildInvoicePdf draws, so the
+ *  PDF carries the same Size/Pcs/unit detail as the counter print. */
+export const pdfLine = (it: Line) => ({
+  desc: str(it.desc),
+  qty: num(it.qty),
+  rate: num(it.rate),
+  size: sizeLabel(it),
+  unit: str(it.unit),
+  pcs: num(it.pcs),
+});
 
 export function computeTotals(lines: Line[], discType: string | undefined, discValRaw: unknown, taxPctRaw: unknown) {
   const subtotal = lines.reduce((s, it) => s + num(it.qty) * num(it.rate), 0);
@@ -207,10 +234,14 @@ export async function reverseStockSafely(invoiceId: string, reason: string, user
 }
 
 // ── PDF from a stored invoice record ─────────────────────────────────────────
+// Feeds the builder everything the counter print shows — purpose, per-line
+// size/pcs/unit and the tax rate (so CGST/SGST can be split) — so an emailed,
+// downloaded or link-opened invoice matches the paper copy exactly.
 type InvoiceRecord = {
-  invoiceNo: string; date: Date; business: unknown;
+  invoiceNo: string; date: Date; createdAt?: Date; business: unknown;
   clientName: string; clientAddr: string | null; clientPhone: string | null;
   clientEmail: string | null; clientGstin: string | null;
+  purpose?: string | null;
   items: unknown; subtotal: unknown; discType: string; discVal: unknown;
   discountAmt: unknown; taxPct: unknown; taxAmt: unknown; total: unknown;
   paidAmount: unknown; notes: string | null; warranty: string | null;
@@ -221,6 +252,7 @@ export async function buildInvoicePdfFromRecord(invoice: InvoiceRecord): Promise
   return buildInvoicePdf({
     invNo: invoice.invoiceNo,
     date: fmtDate(invoice.date.toISOString()),
+    time: invoice.createdAt ? fmtTime(invoice.createdAt.toISOString()) : "",
     biz,
     client: {
       name: invoice.clientName,
@@ -229,12 +261,14 @@ export async function buildInvoicePdfFromRecord(invoice: InvoiceRecord): Promise
       email: invoice.clientEmail || "",
       gstin: invoice.clientGstin || "",
     },
-    lines: items.map((it) => ({ desc: str(it.desc), qty: num(it.qty), rate: num(it.rate) })),
+    purpose: str(invoice.purpose),
+    lines: items.map(pdfLine),
     subtotal: Number(invoice.subtotal),
     discountAmt: Number(invoice.discountAmt),
     discountLabel: `Discount${invoice.discType === "percent" ? ` (${Number(invoice.discVal)}%)` : ""}`,
     taxAmt: Number(invoice.taxAmt),
     taxLabel: `GST (${Number(invoice.taxPct)}%)`,
+    taxPct: Number(invoice.taxPct),
     total: Number(invoice.total),
     paidAmount: Number(invoice.paidAmount),
     notes: invoice.notes || "",
