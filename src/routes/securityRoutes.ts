@@ -22,6 +22,26 @@ router.get("/status", async (_req: Request, res: Response) => {
   }
 });
 
+/* POST /api/security/verify — check a PIN without performing an action.
+   Used by screens that gate themselves behind the PIN (Income & Expense).
+   Deliberately returns only a boolean: it unlocks a view, it does not
+   authorise anything, so the real guard on money-moving routes stays the
+   per-request PIN they already demand. */
+router.post("/verify", async (req: Request, res: Response) => {
+  try {
+    if (!(await isPinSet())) {
+      return res.status(409).json({ message: "No security PIN is set yet. Set one in Settings first." });
+    }
+    if (!(await verifyPin(str(req.body.pin)))) {
+      return res.status(403).json({ message: "Incorrect security PIN." });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("verify PIN failed:", err);
+    res.status(500).json({ message: "Couldn't check the PIN." });
+  }
+});
+
 /* POST /api/security/pin — set or change the billing PIN.
      First-time setup  → confirm with the admin ACCOUNT password (bootstrap).
      Changing existing → require the CURRENT PIN.
