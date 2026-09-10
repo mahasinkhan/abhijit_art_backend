@@ -33,16 +33,21 @@ import { drawUpiQr, upiPayload, upiConfigured, UPI_ID } from "./invoiceQr.js";
      DejaVuSans.ttf       + DejaVuSans-Bold.ttf
    ══════════════════════════════════════════════════════════════ */
 
-/* ── palette, matching the print template ── */
-const ACCENT = "#c56a3a";   // terracotta
-const INK    = "#2a231d";
-const BODY   = "#545a67";
-const MUTE   = "#8a8378";
-const FAINT  = "#b3ab9f";
-const LINE   = "#f2ddd0";   // warm hairline
-const HAIR   = "#f6ece4";   // row separator
-const SOFT   = "#fdf0e7";   // table head / totals box fill
-const GREEN  = "#15803d";
+/* ── palette, matching the print template ──
+   Deliberately much darker than it looks on a monitor. Ink and toner both
+   lighten a shade or two on paper: the original terracotta on a near-white
+   tint printed washed out, with the table head coming through as an almost
+   invisible band. Judge these on paper, not on screen. */
+const ACCENT = "#8f3517";   // terracotta
+const DEEP   = "#542610";   // darker terracotta for small label text
+const INK    = "#241d17";
+const BODY   = "#332d26";
+const MUTE   = "#5a534b";
+const FAINT  = "#7a7168";
+const LINE   = "#dbb9a4";   // warm hairline
+const HAIR   = "#e8d5c8";   // row separator
+const SOFT   = "#f5d3c0";   // table head / totals box fill
+const GREEN  = "#0d5228";
 
 export type PdfParty = {
   name?: string; address?: string; phone?: string; email?: string; gstin?: string; pan?: string;
@@ -382,7 +387,7 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
       const drawHead = (ty: number) => {
         doc.rect(0, ty, PW, 18).fill(SOFT);
         doc.moveTo(0, ty).lineTo(PW, ty).lineWidth(0.8).stroke(LINE);
-        doc.font(F_BOLD).fontSize(6.4).fillColor("#7a5240");
+        doc.font(F_BOLD).fontSize(6.4).fillColor(DEEP);
         const th = ty + 6;
         doc.text("NO.",         X_NUM,  th, { width: W_NUM,  align: "center" });
         doc.text("DESCRIPTION", X_DESC, th, { width: W_DESC });
@@ -443,7 +448,7 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
       });
 
       if (!lines.length) {
-        doc.font(F_REG).fontSize(8).fillColor("#c4bdb2")
+        doc.font(F_REG).fontSize(8).fillColor("#a49a8f")
           .text("No items", PAD, y + 12, { width: CW, align: "center" });
         y += 34;
       }
@@ -544,7 +549,7 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
       const boxH = 40 + (showRecv ? 16 : 0) + (hasDue || paidFull ? 13 : 0);
       doc.rect(R_X, ry, R_W, boxH).fillAndStroke(SOFT, LINE);
       let gy = ry + 9;
-      doc.font(F_BOLD).fontSize(8).fillColor("#7a5240")
+      doc.font(F_BOLD).fontSize(8).fillColor(DEEP)
         .text("Total Amount", R_X + 9, gy + 4, { width: R_W * 0.45 });
       doc.font(F_BOLD).fontSize(13).fillColor(ACCENT)
         .text(money(inv.total), R_X + R_W * 0.42, gy - 1, { width: R_W * 0.58 - 9, align: "right" });
@@ -559,7 +564,7 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
       }
 
       if (hasDue) {
-        doc.font(F_BOLD).fontSize(7.6).fillColor("#7a5240")
+        doc.font(F_BOLD).fontSize(7.6).fillColor(DEEP)
           .text("Balance Due", R_X + 9, gy, { width: R_W * 0.5 })
           .text(money(balance), R_X + R_W * 0.45, gy, { width: R_W * 0.55 - 9, align: "right" });
       } else if (paidFull) {
@@ -579,10 +584,10 @@ export function buildInvoicePdf(inv: PdfInvoice): Promise<Buffer> {
         .text("Thank you for your business!", PAD, tyY, { width: CW, align: "center" });
       const tw = doc.widthOfString("Thank you for your business!");
       const gap = 12;
-      doc.opacity(0.45)
+      doc.opacity(0.7)
         .moveTo(PAD, tyY + 5).lineTo(PAD + CW / 2 - tw / 2 - gap, tyY + 5)
         .moveTo(PAD + CW / 2 + tw / 2 + gap, tyY + 5).lineTo(RIGHT, tyY + 5)
-        .lineWidth(0.6).stroke(ACCENT)
+        .lineWidth(0.7).stroke(ACCENT)
         .opacity(1);
 
       /* ── footer on every page ──────────────────────────────────────────
