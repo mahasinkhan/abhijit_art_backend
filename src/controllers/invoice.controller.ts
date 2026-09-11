@@ -18,6 +18,10 @@ import {
   pdfSigValid, invoicePdfUrl,
   type Party, type Line, type InvoiceStockSync,
 } from "../services/invoice.service.js";
+// Account-level payments (the customer's running tab) are allocated to invoices
+// at read time — Invoice.paidAmount alone only knows about per-invoice Payment
+// rows, so any list that reads it raw under-reports customers who pay on account.
+import { buildSettlement } from "../services/accountLedger.js";
 
 /* Audits stock activity — including the failures. A silent failure is the one
    thing this must not do, so unresolved lines and thrown errors are logged
@@ -435,25 +439,51 @@ export async function saveInvoice(req: Request, res: Response) {
   }
 }
 
-/* ── GET / — list all ── */
+/* ── GET / — list all ──
+   Invoice.paidAmount is only a cache of this invoice's own Payment rows. Money
+   the customer paid onto their running tab (CustomerPayment) is allocated here
+   at read time, oldest bill first, so a bill settled from the tab no longer
+   reports ₹0 paid. The rows already loaded are handed to buildSettlement, so
+   this costs two extra queries in total — not one per invoice. */
 export async function listInvoices(req: Request, res: Response) {
   try {
     const invoices = await prisma.invoice.findMany({
       orderBy: { createdAt: "desc" },
       include: { ...withPayments, customer: { select: { email: true, phone: true } } },
     });
+
+    const { byInvoice } = await buildSettlement(
+      invoices as unknown as Parameters<typeof buildSettlement>[0],
+    );
+
     // contactEmail/contactPhone = where to actually reach this client TODAY.
     // The Customer record wins because it is the live, editable one — the
     // clientEmail/clientPhone on the bill is a historical snapshot frozen at
     // billing time, so editing a customer's number must change who gets the
     // reminder without rewriting old invoices. The snapshot is the fallback
     // for bills that were never linked to a customer.
-    res.json(invoices.map((inv) => ({
-      ...inv,
-      contactEmail: inv.customer?.email || inv.clientEmail || null,
-      contactPhone: inv.customer?.phone || inv.clientPhone || null,
-      pdfUrl: invoicePdfUrl(req, inv.id),
-    })));
+    res.json(invoices.map((inv) => {
+      const settled = byInvoice.get(inv.id);
+      const total = Number(inv.total);
+      const legacyPaid = Number(inv.paidAmount);
+
+      return {
+        ...inv,
+        // the figure the UI should show — per-invoice payments PLUS the slice of
+        // the customer's tab that lands on this bill
+        paidAmount: settled ? settled.settled : legacyPaid,
+        legacyPaid,
+        accountPaid: settled?.accountPaid ?? 0,
+        accountCash: settled?.accountCash ?? 0,
+        accountOnline: settled?.accountOnline ?? 0,
+        balanceDue: settled ? settled.due : round2(Math.max(total - legacyPaid, 0)),
+        // a cancelled bill keeps its own status; everything else follows the ledger
+        status: inv.status === "cancelled" ? inv.status : (settled?.status ?? inv.status),
+        contactEmail: inv.customer?.email || inv.clientEmail || null,
+        contactPhone: inv.customer?.phone || inv.clientPhone || null,
+        pdfUrl: invoicePdfUrl(req, inv.id),
+      };
+    }));
   } catch (err) {
     console.error("Invoice list failed:", err);
     res.status(500).json({ message: (err as Error).message || "Couldn't load invoices." });
@@ -469,8 +499,22 @@ export async function getInvoice(req: Request, res: Response) {
       include: { ...withPayments, customer: { select: { email: true, phone: true } } },
     });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
+
+    // same account-tab allocation the list does, so a single fetch agrees with it
+    const { byInvoice } = await buildSettlement();
+    const settled = byInvoice.get(invoice.id);
+    const total = Number(invoice.total);
+    const legacyPaid = Number(invoice.paidAmount);
+
     res.json({
       ...invoice,
+      paidAmount: settled ? settled.settled : legacyPaid,
+      legacyPaid,
+      accountPaid: settled?.accountPaid ?? 0,
+      accountCash: settled?.accountCash ?? 0,
+      accountOnline: settled?.accountOnline ?? 0,
+      balanceDue: settled ? settled.due : round2(Math.max(total - legacyPaid, 0)),
+      status: invoice.status === "cancelled" ? invoice.status : (settled?.status ?? invoice.status),
       contactEmail: invoice.customer?.email || invoice.clientEmail || null,
       contactPhone: invoice.customer?.phone || invoice.clientPhone || null,
       pdfUrl: invoicePdfUrl(req, invoice.id),
@@ -518,12 +562,20 @@ export async function remindInvoice(req: Request, res: Response) {
       include: { ...withPayments, customer: { select: { email: true, phone: true } } },
     });
     if (!invoice) return res.status(404).json({ message: "Invoice not found." });
-    if (invoice.status === "paid") return res.status(400).json({ message: "This invoice is already fully paid." });
     if (invoice.status === "cancelled") return res.status(400).json({ message: "This invoice is cancelled — reactivate it before reminding." });
 
+    // the balance must account for the customer's running tab as well, or a bill
+    // already settled from the account would still be chased for payment
+    const { byInvoice } = await buildSettlement();
+    const settledRow = byInvoice.get(invoice.id);
+
     const total = Number(invoice.total);
-    const paid = Number(invoice.paidAmount);
-    const balance = round2(Math.max(total - paid, 0));
+    const paid = settledRow ? settledRow.settled : Number(invoice.paidAmount);
+    const balance = settledRow ? settledRow.due : round2(Math.max(total - paid, 0));
+
+    if (invoice.status === "paid" || (settledRow && settledRow.status === "paid")) {
+      return res.status(400).json({ message: "This invoice is already fully paid." });
+    }
     if (balance <= 0.005) return res.status(400).json({ message: "Nothing due on this invoice." });
 
     const subject = str(req.body?.subject) || `Payment reminder — invoice ${invoice.invoiceNo}`;
@@ -645,6 +697,8 @@ export async function remindInvoice(req: Request, res: Response) {
 
     res.json({
       ...updated,
+      paidAmount: paid,
+      balanceDue: balance,
       contactEmail: updated.customer?.email || updated.clientEmail || null,
       contactPhone: updated.customer?.phone || updated.clientPhone || null,
       pdfUrl: invoicePdfUrl(req, updated.id),

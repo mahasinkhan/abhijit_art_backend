@@ -1,9 +1,17 @@
 // backend/src/routes/incomeExpenseRoutes.ts
 // Day-to-day cash book: money in and money out. Nothing here touches
 // Invoices or Quick Orders — this is the shop's own pocket diary.
+//
+// SECURITY: reading and writing entries needs an admin session. DELETING one
+// additionally needs the billing PIN, entered per action — the same guard the
+// invoice delete/cancel/payment routes use, and for the same reason: several
+// staff share the admin login, so removing a money record must leave a trail
+// that names who did it. The PIN gate on the page itself is only a UI lock
+// (sessionStorage) and never reached the API; this one is enforced server-side.
 import { Router } from "express";
 import { prisma } from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.js";
+import { isPinSet, verifyPin, logAudit } from "../utils/security.js";
 import { normalisePhone } from "./payeeRoutes.js";
 
 const router = Router();
@@ -27,6 +35,18 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 
 const asKind   = (v: any): Kind   => (v === "income" ? "income" : "expense");
 const asMethod = (v: any): Method => (METHODS.includes(v) ? v : "cash");
+
+/** Money actions need the security PIN. Returns an error to send back, or null
+ *  when the PIN is correct. Mirrors pinError() in invoice.controller.ts. */
+async function pinError(req: any): Promise<{ code: number; message: string } | null> {
+  if (!(await isPinSet())) {
+    return { code: 409, message: "No security PIN is set yet. Set one in Settings before deleting entries." };
+  }
+  if (!(await verifyPin(String(req.body?.pin || "")))) {
+    return { code: 403, message: "Incorrect security PIN." };
+  }
+  return null;
+}
 
 /** A category only counts if it belongs to the direction being saved. */
 function asCategory(v: any, kind: Kind): Category {
@@ -214,6 +234,8 @@ router.get("/:id", async (req, res) => {
 
 /* ───────────────────────── create ───────────────────────── */
 // POST /api/income-expense  { kind, date?, category, title, amount, method, payeeId?, notes? }
+// `notes` is the free-text PURPOSE and applies to BOTH directions — what an
+// expense went on, or where a receipt came from.
 router.post("/", async (req: any, res) => {
   try {
     const { kind, date, category, title, amount, method, payeeId, notes } = req.body || {};
@@ -314,12 +336,45 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-/* ───────────────────────── delete ───────────────────────── */
+/* ───────────────────────── delete ─────────────────────────
+   PIN-gated and audited: money leaving the book is the one action here that
+   can't be reconstructed from the screen afterwards, so the entry's details
+   are written to the audit trail BEFORE the row goes. Send the PIN in the
+   request body — with axios that means `{ data: { pin } }` on a DELETE. */
 router.delete("/:id", async (req, res) => {
   try {
-    const existing = await prisma.expense.findUnique({ where: { id: req.params.id } });
+    const pe = await pinError(req);
+    if (pe) return res.status(pe.code).json({ error: pe.message });
+
+    const existing = await prisma.expense.findUnique({ where: { id: req.params.id }, include });
     if (!existing) return res.status(404).json({ error: "Entry not found" });
+
     await prisma.expense.delete({ where: { id: req.params.id } });
+
+    const amount = num(existing.amount);
+    const who = (existing as any).payee?.name || existing.title;
+    await logAudit({
+      req,
+      action: "cashbook.delete",
+      entity: "cashbook",
+      entityId: existing.id,
+      entityRef: existing.title,
+      summary:
+        `Deleted ${existing.kind === "income" ? "income" : "expense"} entry "${existing.title}"` +
+        ` — ₹${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` +
+        ` ${existing.method}${who && who !== existing.title ? ` (${who})` : ""}`,
+      detail: {
+        kind: existing.kind,
+        category: existing.category,
+        title: existing.title,
+        amount,
+        method: existing.method,
+        date: existing.date,
+        notes: existing.notes || null,
+        payee: (existing as any).payee?.name || null,
+      },
+    });
+
     res.json({ ok: true });
   } catch (err) {
     console.error("cashbook delete", err);
