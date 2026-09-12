@@ -1,0 +1,1 @@
+ALTER TABLE "Expense" ADD COLUMN "phone" TEXT;

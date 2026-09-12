@@ -611,6 +611,8 @@ model Expense {
   title    String
   amount   Decimal     @db.Decimal(12, 2)
   method   PaymentMethod @default(cash)
+  phone       String?    
+
 
   /// optional — a shop sale has no person attached, a loan always does
   payee   Payee?  @relation(fields: [payeeId], references: [id], onDelete: Restrict)

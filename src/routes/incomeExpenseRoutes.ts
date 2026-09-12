@@ -8,6 +8,12 @@
 // staff share the admin login, so removing a money record must leave a trail
 // that names who did it. The PIN gate on the page itself is only a UI lock
 // (sessionStorage) and never reached the API; this one is enforced server-side.
+//
+// PHONE: an entry carries its own optional number. On the expense side the
+// person record usually holds it, but income has no person — a counter sale
+// isn't on the payroll — so the number has to live on the entry or be lost.
+// Stored digits-only through the same normaliser the payee table uses, so one
+// number written three ways still matches one search.
 import { Router } from "express";
 import { prisma } from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.js";
@@ -35,6 +41,17 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 
 const asKind   = (v: any): Kind   => (v === "income" ? "income" : "expense");
 const asMethod = (v: any): Method => (METHODS.includes(v) ? v : "cash");
+
+/** Digits only, via the payee normaliser, so "+91 98765 43210", "098765 43210"
+ *  and "9876543210" all land the same way and a search on any of them hits.
+ *  Anything the normaliser can't read (an extension, a landline written oddly)
+ *  is kept as typed rather than thrown away. Empty → null, so the column stays
+ *  meaningfully blank instead of holding "". */
+const asPhone = (v: any): string | null => {
+  const raw = String(v ?? "").trim();
+  if (!raw) return null;
+  return normalisePhone(raw) || raw;
+};
 
 /** Money actions need the security PIN. Returns an error to send back, or null
  *  when the PIN is correct. Mirrors pinError() in invoice.controller.ts. */
@@ -109,25 +126,45 @@ const include = {
 const shape = (e: any) => ({ ...e, amount: num(e.amount) });
 
 /* ───────────────────────── list ───────────────────────── */
-// GET /api/income-expense?from=&to=&kind=&category=&method=&search=&payeeId=
+// GET /api/income-expense?from=&to=&kind=&category=&method=&search=&payeeId=&phone=
 router.get("/", async (req, res) => {
   try {
     const { from, to } = readRange(req.query);
-    const { kind, category, method, search, payeeId } = req.query as Record<string, string>;
+    const { kind, category, method, search, payeeId, phone } = req.query as Record<string, string>;
 
     const where: any = { date: { gte: from, lte: to } };
     if (kind === "income" || kind === "expense") where.kind = kind;
     if (category) where.category = category;
     if (method && METHODS.includes(method as Method)) where.method = method;
     if (payeeId) where.payeeId = payeeId;
+
+    // A number on its own pulls every entry tied to it, whichever side it
+    // came from — the entry's own phone or the linked person's.
+    if (phone) {
+      const digits = normalisePhone(phone);
+      if (digits) {
+        where.OR = [
+          { phone: { contains: digits } },
+          { payee: { phone: { contains: digits } } },
+        ];
+      }
+    }
+
     if (search) {
       const digits = normalisePhone(search);
-      where.OR = [
+      const or = [
         { title: { contains: search, mode: "insensitive" } },
         { notes: { contains: search, mode: "insensitive" } },
         { payee: { name: { contains: search, mode: "insensitive" } } },
-        ...(digits ? [{ payee: { phone: { contains: digits } } }] : []),
+        ...(digits ? [
+          { phone: { contains: digits } },
+          { payee: { phone: { contains: digits } } },
+        ] : []),
       ];
+      // A phone filter and a search term are an AND, not a wider OR — two
+      // filters should narrow the list, never widen it.
+      if (where.OR) { where.AND = [{ OR: where.OR }, { OR: or }]; delete where.OR; }
+      else          { where.OR = or; }
     }
 
     const rows = await prisma.expense.findMany({
@@ -233,12 +270,13 @@ router.get("/:id", async (req, res) => {
 });
 
 /* ───────────────────────── create ───────────────────────── */
-// POST /api/income-expense  { kind, date?, category, title, amount, method, payeeId?, notes? }
+// POST /api/income-expense
+//   { kind, date?, category, title, amount, method, payeeId?, phone?, notes? }
 // `notes` is the free-text PURPOSE and applies to BOTH directions — what an
-// expense went on, or where a receipt came from.
+// expense went on, or where a receipt came from. `phone` is optional on both.
 router.post("/", async (req: any, res) => {
   try {
-    const { kind, date, category, title, amount, method, payeeId, notes } = req.body || {};
+    const { kind, date, category, title, amount, method, payeeId, phone, notes } = req.body || {};
 
     const k   = asKind(kind);
     const amt = round2(Number(amount));
@@ -254,11 +292,21 @@ router.post("/", async (req: any, res) => {
     }
 
     let linkId: string | null = null;
+    let payeePhone: string | null = null;
     if (payeeId) {
-      const payee = await prisma.payee.findUnique({ where: { id: payeeId }, select: { id: true } });
+      const payee = await prisma.payee.findUnique({
+        where: { id: payeeId }, select: { id: true, phone: true },
+      });
       if (!payee) return res.status(400).json({ error: "That person is not in the list — add them first" });
       linkId = payee.id;
+      payeePhone = payee.phone || null;
     }
+
+    // A number the person record already holds isn't copied onto the entry —
+    // it would be a second place to correct later. Only a number that differs
+    // (or has nowhere else to live, as on the income side) is stored here.
+    const typed = asPhone(phone);
+    const ownPhone = typed && typed !== payeePhone ? typed : null;
 
     const row = await prisma.expense.create({
       data: {
@@ -269,6 +317,7 @@ router.post("/", async (req: any, res) => {
         amount: amt,
         method: asMethod(method),
         payeeId: linkId,
+        phone: ownPhone,
         notes: String(notes || "").trim(),
         createdById: req.user?.id || null,
       },
@@ -288,7 +337,7 @@ router.patch("/:id", async (req, res) => {
     const existing = await prisma.expense.findUnique({ where: { id: req.params.id } });
     if (!existing) return res.status(404).json({ error: "Entry not found" });
 
-    const { kind, date, category, title, amount, method, payeeId, notes } = req.body || {};
+    const { kind, date, category, title, amount, method, payeeId, phone, notes } = req.body || {};
     const data: any = {};
 
     const k = kind !== undefined ? asKind(kind) : (existing.kind as Kind);
@@ -302,6 +351,7 @@ router.patch("/:id", async (req, res) => {
     if (date !== undefined)   data.date   = dayNoonUTC(date);
     if (method !== undefined) data.method = asMethod(method);
     if (notes !== undefined)  data.notes  = String(notes || "").trim();
+    if (phone !== undefined)  data.phone  = asPhone(phone);   // "" clears it
 
     if (title !== undefined) {
       if (!String(title).trim()) return res.status(400).json({ error: "Title is required" });
@@ -353,6 +403,9 @@ router.delete("/:id", async (req, res) => {
 
     const amount = num(existing.amount);
     const who = (existing as any).payee?.name || existing.title;
+    // The number goes into the trail too — it's often the only way to reach
+    // the other side of a deleted entry and ask what it was.
+    const phone = (existing as any).phone || (existing as any).payee?.phone || null;
     await logAudit({
       req,
       action: "cashbook.delete",
@@ -362,7 +415,8 @@ router.delete("/:id", async (req, res) => {
       summary:
         `Deleted ${existing.kind === "income" ? "income" : "expense"} entry "${existing.title}"` +
         ` — ₹${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` +
-        ` ${existing.method}${who && who !== existing.title ? ` (${who})` : ""}`,
+        ` ${existing.method}${who && who !== existing.title ? ` (${who})` : ""}` +
+        `${phone ? ` · ${phone}` : ""}`,
       detail: {
         kind: existing.kind,
         category: existing.category,
@@ -370,6 +424,7 @@ router.delete("/:id", async (req, res) => {
         amount,
         method: existing.method,
         date: existing.date,
+        phone,
         notes: existing.notes || null,
         payee: (existing as any).payee?.name || null,
       },
