@@ -31,6 +31,7 @@ import taskRoutes from "./routes/taskRoutes.js";
 import quickOrderRoutes from "./routes/quickOrderRoutes.js";
 import incomeExpenseRoutes from "./routes/incomeExpenseRoutes.js";
 import payeeRoutes from "./routes/payeeRoutes.js";
+import heroRoutes from "./routes/heroRoutes.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -128,6 +129,8 @@ app.use("/api/income-expense", incomeExpenseRoutes);
 // is the single place that shapes an error into a JSON response. errorHandler
 // MUST be the last app.use — Express identifies it as an error handler by its
 // 4-argument signature.
+app.use("/api/hero", heroRoutes);
+
 app.use(notFound);
 app.use(errorHandler);
 

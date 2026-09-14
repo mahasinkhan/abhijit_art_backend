@@ -43,7 +43,7 @@ export const compressAndUpload = async (
     const result = await new Promise<UploadApiResponse>((resolve, reject) => {
       const stream = cloudinary.uploader.upload_stream(
         {
-          folder:        "avijit-art/posts",
+          folder:        (req as Request & { cloudinaryFolder?: string }).cloudinaryFolder || "avijit-art/posts",
           resource_type: "image",
           format:        "webp",
           eager: [
