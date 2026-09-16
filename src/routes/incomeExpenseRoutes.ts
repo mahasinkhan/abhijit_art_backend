@@ -6,14 +6,16 @@
 // register is written the way the paper book is, one payment per row. The
 // joining-up happens only at read time, per person, in the ledger.
 //
-// SECURITY: reading and writing entries needs an admin session. DELETING one
+// SECURITY: reading needs an admin session. CHANGING or REMOVING an entry
 // additionally needs the billing PIN, entered per action — the same guard the
-// invoice delete/cancel/payment routes use, and for the same reason: several
-// staff share the admin login, so removing a money record must leave a trail
-// that names who did it. The PIN gate on the page itself is only a UI lock
-// (sessionStorage) and never reached the API; this one is enforced server-side.
+// invoice routes use, and for the same reason: several staff share the admin
+// login, so any hand on the money must be identifiable. Editing is audited on
+// top of that, field by field, old value to new: the PIN says who was allowed
+// to act, and the trail says what they actually did. The PIN gate on the page
+// itself is only a UI lock (sessionStorage) and never reached the API; these
+// are enforced server-side.
 //
-// PEOPLE: BOTH directions may name a person now. A customer who pays at the
+// PEOPLE: BOTH directions may name a person. A customer who pays at the
 // counter and is later paid for a job is one person with one history, so the
 // income side links to the same Payee table the expense side uses.
 //
@@ -51,6 +53,11 @@ const round2 = (n: number) => Math.round(n * 100) / 100;
 const asKind   = (v: any): Kind   => (v === "income" ? "income" : "expense");
 const asMethod = (v: any): Method => (METHODS.includes(v) ? v : "cash");
 
+const money = (n: number) =>
+  `₹${n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+
+const dayStr = (d: any) => new Date(d).toISOString().slice(0, 10);
+
 /** Digits only, via the payee normaliser, so "+91 98765 43210", "098765 43210"
  *  and "9876543210" all land the same way and a search on any of them hits.
  *  Anything the normaliser can't read (an extension, a landline written oddly)
@@ -66,7 +73,7 @@ const asPhone = (v: any): string | null => {
  *  when the PIN is correct. Mirrors pinError() in invoice.controller.ts. */
 async function pinError(req: any): Promise<{ code: number; message: string } | null> {
   if (!(await isPinSet())) {
-    return { code: 409, message: "No security PIN is set yet. Set one in Settings before deleting entries." };
+    return { code: 409, message: "No security PIN is set yet. Set one in Settings before changing entries." };
   }
   if (!(await verifyPin(String(req.body?.pin || "")))) {
     return { code: 403, message: "Incorrect security PIN." };
@@ -315,6 +322,8 @@ router.get("/:id", async (req, res) => {
 // `notes` is the free-text PURPOSE and applies to BOTH directions — what an
 // expense went on, or where a receipt came from. `phone` is optional on both,
 // as is `payeeId`: a walk-in nobody expects to see again needs no record.
+// No PIN here: writing a new line is the ordinary work of the day, and the
+// entry is on screen to be checked the moment it lands.
 router.post("/", async (req: any, res) => {
   try {
     const { kind, date, category, title, amount, method, payeeId, phone, notes } = req.body || {};
@@ -360,12 +369,20 @@ router.post("/", async (req: any, res) => {
 });
 
 /* ───────────────────────── update ─────────────────────────
-   Correcting a written entry — a wrong amount, the wrong person, cash that
-   was actually online. Only the fields sent are touched, so the form can
-   send one changed field without restating the rest. */
+   Correcting a written entry — a wrong amount, the wrong person, cash that was
+   actually online. PIN-gated like the delete: changing a figure carries the
+   same weight as removing one, and the admin login is shared.
+
+   On top of the PIN, every field that actually moved is written to the audit
+   trail as old → new. An edit that changes nothing writes nothing — opening a
+   row and closing it is not an event worth recording. Only the fields sent are
+   touched, so the form can send one changed field without restating the rest. */
 router.patch("/:id", async (req, res) => {
   try {
-    const existing = await prisma.expense.findUnique({ where: { id: req.params.id } });
+    const pe = await pinError(req);
+    if (pe) return res.status(pe.code).json({ error: pe.message });
+
+    const existing = await prisma.expense.findUnique({ where: { id: req.params.id }, include });
     if (!existing) return res.status(404).json({ error: "Entry not found" });
 
     const { kind, date, category, title, amount, method, payeeId, phone, notes } = req.body || {};
@@ -412,6 +429,70 @@ router.patch("/:id", async (req, res) => {
     }
 
     const row = await prisma.expense.update({ where: { id: req.params.id }, data, include });
+
+    /* ── what actually moved ──
+       Compared AFTER the write, against the row as it now stands, so the trail
+       records what was really stored rather than what was asked for. Amounts,
+       dates and the person are named the way a human would read them back. */
+    const changes: { field: string; from: any; to: any; text: string }[] = [];
+    const note = (field: string, from: any, to: any, text: string) =>
+      changes.push({ field, from, to, text });
+
+    if (data.amount !== undefined && num(existing.amount) !== num(row.amount)) {
+      note("amount", num(existing.amount), num(row.amount),
+        `amount ${money(num(existing.amount))} → ${money(num(row.amount))}`);
+    }
+    if (data.title !== undefined && existing.title !== row.title) {
+      note("title", existing.title, row.title, `name "${existing.title}" → "${row.title}"`);
+    }
+    if (data.method !== undefined && existing.method !== row.method) {
+      note("method", existing.method, row.method, `${existing.method} → ${row.method}`);
+    }
+    if (data.date !== undefined && dayStr(existing.date) !== dayStr(row.date)) {
+      note("date", dayStr(existing.date), dayStr(row.date),
+        `date ${dayStr(existing.date)} → ${dayStr(row.date)}`);
+    }
+    if (data.kind !== undefined && existing.kind !== row.kind) {
+      note("kind", existing.kind, row.kind, `moved from ${existing.kind} to ${row.kind}`);
+    }
+    if (data.category !== undefined && existing.category !== row.category) {
+      note("category", existing.category, row.category, `category ${existing.category} → ${row.category}`);
+    }
+    if (data.notes !== undefined && (existing.notes || "") !== (row.notes || "")) {
+      note("notes", existing.notes || null, row.notes || null,
+        `purpose "${existing.notes || "—"}" → "${row.notes || "—"}"`);
+    }
+    if (data.phone !== undefined && (existing.phone || null) !== (row.phone || null)) {
+      note("phone", existing.phone || null, row.phone || null,
+        `phone ${existing.phone || "—"} → ${row.phone || "—"}`);
+    }
+    if (data.payeeId !== undefined && (existing.payeeId || null) !== (row.payeeId || null)) {
+      const wasName = (existing as any).payee?.name || "nobody";
+      const nowName = (row as any).payee?.name || "nobody";
+      note("payee", wasName, nowName, `person ${wasName} → ${nowName}`);
+    }
+
+    if (changes.length) {
+      const who = (row as any).payee?.name || row.title;
+      await logAudit({
+        req,
+        action: "cashbook.update",
+        entity: "cashbook",
+        entityId: row.id,
+        entityRef: row.title,
+        summary:
+          `Edited ${row.kind === "income" ? "income" : "expense"} entry "${row.title}"` +
+          `${who && who !== row.title ? ` (${who})` : ""}` +
+          ` — ${changes.map((c) => c.text).join(", ")}`,
+        detail: {
+          entryId: row.id,
+          kind: row.kind,
+          date: dayStr(row.date),
+          changes: changes.map(({ field, from, to }) => ({ field, from, to })),
+        },
+      });
+    }
+
     res.json(shape(row));
   } catch (err) {
     console.error("cashbook update", err);
@@ -447,7 +528,7 @@ router.delete("/:id", async (req, res) => {
       entityRef: existing.title,
       summary:
         `Deleted ${existing.kind === "income" ? "income" : "expense"} entry "${existing.title}"` +
-        ` — ₹${amount.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` +
+        ` — ${money(amount)}` +
         ` ${existing.method}${who && who !== existing.title ? ` (${who})` : ""}` +
         `${phone ? ` · ${phone}` : ""}`,
       detail: {
