@@ -2,6 +2,10 @@
 // Day-to-day cash book: money in and money out. Nothing here touches
 // Invoices or Quick Orders — this is the shop's own pocket diary.
 //
+// Every entry stands on its own line and is never rolled up with another: the
+// register is written the way the paper book is, one payment per row. The
+// joining-up happens only at read time, per person, in the ledger.
+//
 // SECURITY: reading and writing entries needs an admin session. DELETING one
 // additionally needs the billing PIN, entered per action — the same guard the
 // invoice delete/cancel/payment routes use, and for the same reason: several
@@ -9,11 +13,16 @@
 // that names who did it. The PIN gate on the page itself is only a UI lock
 // (sessionStorage) and never reached the API; this one is enforced server-side.
 //
-// PHONE: an entry carries its own optional number. On the expense side the
-// person record usually holds it, but income has no person — a counter sale
-// isn't on the payroll — so the number has to live on the entry or be lost.
-// Stored digits-only through the same normaliser the payee table uses, so one
-// number written three ways still matches one search.
+// PEOPLE: BOTH directions may name a person now. A customer who pays at the
+// counter and is later paid for a job is one person with one history, so the
+// income side links to the same Payee table the expense side uses.
+//
+// PHONE: a person is identified by NAME, so their number is optional and may
+// well be missing. When one is typed against a person who has none on file it
+// is promoted onto that person, so it is filled in once rather than repeated
+// on every entry. A number that only belongs to this one entry — a walk-in
+// with no person record — is stored on the entry itself. Digits-only through
+// the payee normaliser, so one number written three ways matches one search.
 import { Router } from "express";
 import { prisma } from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.js";
@@ -70,6 +79,37 @@ function asCategory(v: any, kind: Kind): Category {
   const allowed: readonly string[] = kind === "income" ? INCOME_CATS : EXPENSE_CATS;
   if (allowed.includes(v)) return v;
   return kind === "income" ? "other_income" : "other";
+}
+
+/**
+ * Resolves the person on an entry and decides where a typed number belongs.
+ *
+ * The rule has one purpose: ONE place to correct a number. If the person is
+ * known and has no number yet, the typed one fills their record and nothing is
+ * written on the entry. If their record already has a number, a different one
+ * typed here is treated as specific to this entry (a driver's second phone,
+ * say) and left on the row rather than overwriting the person's.
+ */
+async function resolvePerson(payeeId: any, phone: any) {
+  const typed = asPhone(phone);
+
+  if (!payeeId) return { linkId: null as string | null, ownPhone: typed };
+
+  const payee = await prisma.payee.findUnique({
+    where: { id: String(payeeId) },
+    select: { id: true, phone: true },
+  });
+  if (!payee) return { error: "That person is not in the list — add them first" as const };
+
+  if (typed && !payee.phone) {
+    await prisma.payee.update({ where: { id: payee.id }, data: { phone: typed } });
+    return { linkId: payee.id, ownPhone: null };
+  }
+
+  return {
+    linkId: payee.id,
+    ownPhone: typed && typed !== payee.phone ? typed : null,
+  };
 }
 
 // ── Timezone-safe day handling ──────────────────────────────────────────
@@ -215,12 +255,12 @@ router.get("/summary", async (req, res) => {
       const p = r.payee;
       if (!p) return;
       if (!payMap.has(p.id)) {
-        payMap.set(p.id, { id: p.id, name: p.name, phone: p.phone, kind: p.kind, paid: 0, received: 0, net: 0, count: 0 });
+        payMap.set(p.id, { id: p.id, name: p.name, phone: p.phone || "", kind: p.kind, paid: 0, received: 0, net: 0, count: 0 });
       }
       const e = payMap.get(p.id)!;
       if (r.kind === "income") e.received = round2(e.received + num(r.amount));
       else                     e.paid     = round2(e.paid + num(r.amount));
-      e.net = round2(e.paid - e.received);   // positive = they still owe us
+      e.net = round2(e.paid - e.received);   // positive = we have paid them more
       e.count += 1;
     });
 
@@ -273,7 +313,8 @@ router.get("/:id", async (req, res) => {
 // POST /api/income-expense
 //   { kind, date?, category, title, amount, method, payeeId?, phone?, notes? }
 // `notes` is the free-text PURPOSE and applies to BOTH directions — what an
-// expense went on, or where a receipt came from. `phone` is optional on both.
+// expense went on, or where a receipt came from. `phone` is optional on both,
+// as is `payeeId`: a walk-in nobody expects to see again needs no record.
 router.post("/", async (req: any, res) => {
   try {
     const { kind, date, category, title, amount, method, payeeId, phone, notes } = req.body || {};
@@ -285,28 +326,15 @@ router.post("/", async (req: any, res) => {
 
     const cat = asCategory(category, k);
 
-    // lending, salary and getting money back are always about a person
+    // Lending, salary and getting money back are claims about a person, so the
+    // running balance is only trustworthy if one is named.
     const needsPayee = cat === "lent" || cat === "loan_back" || cat === "salary" || cat === "advance";
     if (needsPayee && !payeeId) {
       return res.status(400).json({ error: "Choose the person this entry belongs to" });
     }
 
-    let linkId: string | null = null;
-    let payeePhone: string | null = null;
-    if (payeeId) {
-      const payee = await prisma.payee.findUnique({
-        where: { id: payeeId }, select: { id: true, phone: true },
-      });
-      if (!payee) return res.status(400).json({ error: "That person is not in the list — add them first" });
-      linkId = payee.id;
-      payeePhone = payee.phone || null;
-    }
-
-    // A number the person record already holds isn't copied onto the entry —
-    // it would be a second place to correct later. Only a number that differs
-    // (or has nowhere else to live, as on the income side) is stored here.
-    const typed = asPhone(phone);
-    const ownPhone = typed && typed !== payeePhone ? typed : null;
+    const person = await resolvePerson(payeeId, phone);
+    if ("error" in person) return res.status(400).json({ error: person.error });
 
     const row = await prisma.expense.create({
       data: {
@@ -316,8 +344,8 @@ router.post("/", async (req: any, res) => {
         title: String(title).trim(),
         amount: amt,
         method: asMethod(method),
-        payeeId: linkId,
-        phone: ownPhone,
+        payeeId: person.linkId,
+        phone: person.ownPhone,
         notes: String(notes || "").trim(),
         createdById: req.user?.id || null,
       },
@@ -331,7 +359,10 @@ router.post("/", async (req: any, res) => {
   }
 });
 
-/* ───────────────────────── update ───────────────────────── */
+/* ───────────────────────── update ─────────────────────────
+   Correcting a written entry — a wrong amount, the wrong person, cash that
+   was actually online. Only the fields sent are touched, so the form can
+   send one changed field without restating the rest. */
 router.patch("/:id", async (req, res) => {
   try {
     const existing = await prisma.expense.findUnique({ where: { id: req.params.id } });
@@ -351,7 +382,6 @@ router.patch("/:id", async (req, res) => {
     if (date !== undefined)   data.date   = dayNoonUTC(date);
     if (method !== undefined) data.method = asMethod(method);
     if (notes !== undefined)  data.notes  = String(notes || "").trim();
-    if (phone !== undefined)  data.phone  = asPhone(phone);   // "" clears it
 
     if (title !== undefined) {
       if (!String(title).trim()) return res.status(400).json({ error: "Title is required" });
@@ -362,14 +392,17 @@ router.patch("/:id", async (req, res) => {
       if (!Number.isFinite(amt) || amt <= 0) return res.status(400).json({ error: "Enter an amount greater than 0" });
       data.amount = amt;
     }
-    if (payeeId !== undefined) {
-      if (payeeId) {
-        const payee = await prisma.payee.findUnique({ where: { id: payeeId }, select: { id: true } });
-        if (!payee) return res.status(400).json({ error: "That person is not in the list" });
-        data.payeeId = payee.id;
-      } else {
-        data.payeeId = null;
-      }
+
+    // Person and number are decided together, by the same rule as on create:
+    // a number typed against someone who has none fills their record instead
+    // of settling on this one row.
+    if (payeeId !== undefined || phone !== undefined) {
+      const id = payeeId !== undefined ? payeeId : existing.payeeId;
+      const ph = phone   !== undefined ? phone   : existing.phone;
+      const person = await resolvePerson(id, ph);
+      if ("error" in person) return res.status(400).json({ error: person.error });
+      if (payeeId !== undefined) data.payeeId = person.linkId;
+      data.phone = person.ownPhone;
     }
 
     const finalCat   = (data.category ?? existing.category) as string;

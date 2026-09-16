@@ -570,15 +570,23 @@ model QuickOrderPayment {
   @@index([orderId, createdAt])
 }
 
-/// Anyone the shop pays money to — staff or outsider.
-/// PHONE IS THE IDENTITY: one phone number = one person, so every payment
-/// to that number groups under the same record no matter how the name was
-/// typed. An employee's Payee row links back to their User account.
+/// Anyone money moves to or from — staff, supplier, or a counter customer.
+/// Both directions of the cash book point here, so one person's page shows
+/// what we paid them and what they paid us in a single history.
+///
+/// THE NAME IS THE IDENTITY. `nameKey` is the name upper-cased with spacing
+/// collapsed, and that is what stays unique: "azad da", "AZAD DA" and
+/// "Azad  Da" are one man. It matches how the studio works — a name is
+/// written down every time, a number often never is. `phone` is therefore an
+/// ordinary detail: optional, editable, and NOT unique (two brothers may
+/// share one handset). An employee's Payee row links back to their User.
 model Payee {
-  id     String    @id @default(cuid())
-  name   String
-  phone  String    @unique
-  kind   PayeeKind @default(outsider)
+  id      String    @id @default(cuid())
+  name    String
+  /// upper-cased, space-collapsed `name` — the unique identity
+  nameKey String    @unique
+  phone   String?
+  kind    PayeeKind @default(outsider)
 
   /// set only for staff — links the payee to their login account
   user   User?   @relation("PayeeUser", fields: [userId], references: [id], onDelete: SetNull)
@@ -596,6 +604,7 @@ model Payee {
   @@index([name])
   @@index([kind])
   @@index([active])
+  @@index([phone])
 }
 
 /// Day-to-day cash book — money in and money out, nothing to do with

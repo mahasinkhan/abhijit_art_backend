@@ -1,5 +1,17 @@
 // backend/src/routes/payeeRoutes.ts
-// The people directory behind the cash book — staff and outsiders alike.
+// The people directory behind the cash book — staff, suppliers and counter
+// customers on ONE list, used by both directions of the book.
+//
+// THE NAME IS THE IDENTITY. That is how the studio actually works: a name is
+// written down every time, a number often never. So the name is matched on a
+// folded key (upper case, spacing collapsed) and `phone` is an ordinary detail
+// — optional, editable, and no longer able to block a save. Leaving the number
+// blank has to work, because the alternative is the name never joining the
+// dropdown at all.
+//
+// Nothing here deletes or merges records. Two people who share a name keep
+// separate rows; POST hands back the existing one so the caller reuses it
+// rather than forking a second history under the same spelling.
 import { Router } from "express";
 import { prisma } from "../config/prisma.js";
 import { protect, adminOnly } from "../middleware/auth.js";
@@ -11,9 +23,17 @@ const num    = (v: any) => Number(v ?? 0);
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
 /**
- * Phone IS the identity, so it has to be stored the same way every time.
- * Keeps digits only and drops a leading 91 / 0 on Indian mobiles, so
- * "+91 97654 32100", "09765432100" and "9765432100" all land on one record.
+ * The identity key. "  azad   da " and "AZAD DA" are one person, so case and
+ * stray spacing are folded away before anything is compared or stored.
+ */
+export function nameKeyOf(raw: any): string {
+  return String(raw || "").trim().replace(/\s+/g, " ").toUpperCase();
+}
+
+/**
+ * Digits only, minus a leading 91 / 0, so the same mobile written three ways
+ * still displays and searches identically. No longer unique — a contact
+ * detail now, not the identity.
  */
 export function normalisePhone(raw: any): string {
   let d = String(raw || "").replace(/\D/g, "");
@@ -22,9 +42,22 @@ export function normalisePhone(raw: any): string {
   return d;
 }
 
+/**
+ * Blank is fine; half-typed is not. A five-digit number on a record is worse
+ * than an empty field, because it looks callable and isn't.
+ */
+function readPhone(raw: any): { value: string | null } | { error: string } {
+  const digits = normalisePhone(raw);
+  if (!digits) return { value: null };
+  if (digits.length !== 10) {
+    return { error: "A phone number must be 10 digits — leave it blank if you don't have it" };
+  }
+  return { value: digits };
+}
+
 const asKind = (v: any) => (v === "employee" ? "employee" : "outsider");
 
-/** Rolls a payee's entries into paid / received / balance. */
+/** Rolls a payee's entries into paid / received / balance, both directions. */
 function withTotals(p: any) {
   const rows = p.expenses || [];
   const paid     = round2(rows.filter((e: any) => e.kind === "expense").reduce((s: number, e: any) => s + num(e.amount), 0));
@@ -35,9 +68,10 @@ function withTotals(p: any) {
   const { expenses: _drop, ...rest } = p;
   return {
     ...rest,
+    phone: rest.phone || "",          // callers have always read a string here
     paid,
     received,
-    /** positive = they still owe us, negative = we owe them */
+    /** positive = we have paid them more than they have paid us */
     net: round2(paid - received),
     entryCount: rows.length,
     lastEntryAt: last?.date || null,
@@ -70,6 +104,8 @@ router.get("/", async (req, res) => {
       orderBy: { name: "asc" },
     });
 
+    // Busiest first, counting both directions — the names written most often
+    // sit nearest the top of the dropdown.
     const shaped = rows.map(withTotals)
       .sort((a, b) => (b.paid + b.received) - (a.paid + a.received));
     res.json(shaped);
@@ -91,22 +127,40 @@ router.post("/sync-employees", async (_req, res) => {
     const skipped: string[] = [];
 
     for (const emp of employees) {
-      const phone = normalisePhone(emp.phone);
-      if (!phone) { skipped.push(emp.name); continue; }
+      const key = nameKeyOf(emp.name);
+      if (!key) { skipped.push(emp.name || "(unnamed)"); continue; }
+
+      // A staff member with no number on file used to be skipped entirely and
+      // so never appeared in the dropdown. The user link is identity enough.
+      const digits = normalisePhone(emp.phone);
+      const store  = digits.length === 10 ? digits : null;
 
       const existingByUser = await prisma.payee.findUnique({ where: { userId: emp.id } });
       if (existingByUser) continue;
 
-      const existingByPhone = await prisma.payee.findUnique({ where: { phone } });
-      if (existingByPhone) {
+      // Match on the name — a staff member already written into the book by
+      // hand is the same person and must not fork into a second record.
+      const existing = await prisma.payee.findUnique({ where: { nameKey: key } });
+
+      if (existing) {
         await prisma.payee.update({
-          where: { id: existingByPhone.id },
-          data: { userId: emp.id, kind: "employee", name: existingByPhone.name || emp.name },
+          where: { id: existing.id },
+          data: {
+            userId: emp.id,
+            kind: "employee",
+            phone: existing.phone || store,   // never overwrite a number on file
+          },
         });
         linked++;
       } else {
         await prisma.payee.create({
-          data: { name: emp.name, phone, kind: "employee", userId: emp.id },
+          data: {
+            name: String(emp.name).trim().replace(/\s+/g, " "),
+            nameKey: key,
+            phone: store,
+            kind: "employee",
+            userId: emp.id,
+          },
         });
         created++;
       }
@@ -167,11 +221,14 @@ router.get("/:id", async (req, res) => {
 
     res.json({
       ...payee,
+      phone: payee.phone || "",
       paid,
       received,
       net: round2(paid - received),
-      cashPaid:   sum(outRows.filter((e) => e.method === "cash")),
-      onlinePaid: sum(outRows.filter((e) => e.method === "online")),
+      cashPaid:       sum(outRows.filter((e) => e.method === "cash")),
+      onlinePaid:     sum(outRows.filter((e) => e.method === "online")),
+      cashReceived:   sum(inRows.filter((e) => e.method === "cash")),
+      onlineReceived: sum(inRows.filter((e) => e.method === "online")),
       entryCount: entries.length,
       lastEntryAt: entries[0]?.date || null,
       entries: entries.map((e) => ({ ...e, amount: num(e.amount) })),
@@ -189,17 +246,28 @@ router.post("/", async (req, res) => {
   try {
     const { name, phone, kind, userId, role, notes } = req.body || {};
 
-    const cleanName = String(name || "").trim();
-    const digits    = normalisePhone(phone);
+    const cleanName = String(name || "").trim().replace(/\s+/g, " ");
+    const key       = nameKeyOf(cleanName);
+    if (!key) return res.status(400).json({ error: "Name is required" });
 
-    if (!cleanName)         return res.status(400).json({ error: "Name is required" });
-    if (digits.length < 10) return res.status(400).json({ error: "Enter a valid 10-digit phone number" });
+    const ph = readPhone(phone);
+    if ("error" in ph) return res.status(400).json({ error: ph.error });
 
-    const clash = await prisma.payee.findUnique({ where: { phone: digits } });
-    if (clash) {
+    // The same name typed again is the same person. Hand the existing record
+    // back so the caller reuses it — history stays on one page instead of
+    // splitting across two spellings of one man's name.
+    const twin = await prisma.payee.findUnique({
+      where: { nameKey: key },
+      include: { user: { select: { id: true, name: true, email: true, role: true } } },
+    });
+    if (twin) {
+      // A number typed alongside a known name is worth keeping if we had none.
+      const filled = ph.value && !twin.phone
+        ? await prisma.payee.update({ where: { id: twin.id }, data: { phone: ph.value } })
+        : twin;
       return res.status(409).json({
-        error: `${clash.name} already uses this number`,
-        payee: clash,
+        error: `${filled.name} is already in the list`,
+        payee: { ...filled, phone: filled.phone || "" },
       });
     }
 
@@ -208,14 +276,20 @@ router.post("/", async (req, res) => {
       const u = await prisma.user.findUnique({ where: { id: userId }, select: { id: true } });
       if (!u) return res.status(400).json({ error: "That employee account no longer exists" });
       const taken = await prisma.payee.findUnique({ where: { userId } });
-      if (taken) return res.status(409).json({ error: "That employee is already in the list" });
+      if (taken) {
+        return res.status(409).json({
+          error: "That employee is already in the list",
+          payee: { ...taken, phone: taken.phone || "" },
+        });
+      }
       linkId = u.id;
     }
 
     const row = await prisma.payee.create({
       data: {
         name: cleanName,
-        phone: digits,
+        nameKey: key,
+        phone: ph.value,
         kind: asKind(linkId ? "employee" : kind),
         userId: linkId,
         role: String(role || "").trim(),
@@ -224,14 +298,20 @@ router.post("/", async (req, res) => {
       include: { user: { select: { id: true, name: true, email: true, role: true } } },
     });
 
-    res.status(201).json({ ...row, paid: 0, received: 0, net: 0, entryCount: 0, lastEntryAt: null });
+    res.status(201).json({
+      ...row, phone: row.phone || "",
+      paid: 0, received: 0, net: 0, entryCount: 0, lastEntryAt: null,
+    });
   } catch (err) {
     console.error("payee create", err);
     res.status(500).json({ error: "Failed to save this person" });
   }
 });
 
-/* ───────────────────────── update ───────────────────────── */
+/* ───────────────────────── update ─────────────────────────
+   Correcting a person: their name, their number, which list they sit in.
+   Entry titles are deliberately NOT rewritten — an entry records what was
+   written on the day, and a historical row is not ours to edit from here. */
 router.patch("/:id", async (req, res) => {
   try {
     const existing = await prisma.payee.findUnique({ where: { id: req.params.id } });
@@ -241,18 +321,28 @@ router.patch("/:id", async (req, res) => {
     const data: any = {};
 
     if (name !== undefined) {
-      if (!String(name).trim()) return res.status(400).json({ error: "Name is required" });
-      data.name = String(name).trim();
-    }
-    if (phone !== undefined) {
-      const digits = normalisePhone(phone);
-      if (digits.length < 10) return res.status(400).json({ error: "Enter a valid 10-digit phone number" });
-      if (digits !== existing.phone) {
-        const clash = await prisma.payee.findUnique({ where: { phone: digits } });
-        if (clash) return res.status(409).json({ error: `${clash.name} already uses this number` });
+      const cleanName = String(name).trim().replace(/\s+/g, " ");
+      const key       = nameKeyOf(cleanName);
+      if (!key) return res.status(400).json({ error: "Name is required" });
+      if (key !== existing.nameKey) {
+        const clash = await prisma.payee.findUnique({ where: { nameKey: key } });
+        if (clash && clash.id !== existing.id) {
+          return res.status(409).json({
+            error: `${clash.name} is already in the list — renaming would make two of them`,
+            payee: { ...clash, phone: clash.phone || "" },
+          });
+        }
+        data.nameKey = key;
       }
-      data.phone = digits;
+      data.name = cleanName;
     }
+
+    if (phone !== undefined) {
+      const ph = readPhone(phone);
+      if ("error" in ph) return res.status(400).json({ error: ph.error });
+      data.phone = ph.value;                  // may be null — the number was cleared
+    }
+
     if (kind !== undefined && !existing.userId) data.kind = asKind(kind);
     if (role   !== undefined) data.role   = String(role || "").trim();
     if (notes  !== undefined) data.notes  = String(notes || "").trim();
@@ -274,7 +364,9 @@ router.patch("/:id", async (req, res) => {
   }
 });
 
-/* ───────────────────────── delete ───────────────────────── */
+/* ───────────────────────── delete ─────────────────────────
+   Only ever for a record with no money against it. Anyone with history is
+   deactivated instead, so no entry is ever orphaned or lost. */
 router.delete("/:id", async (req, res) => {
   try {
     const count = await prisma.expense.count({ where: { payeeId: req.params.id } });
