@@ -649,3 +649,18 @@ model HeroSlide {
 
   @@index([active, order])
 }
+
+model ServiceCard {
+  id        String   @id @default(cuid())
+  name      String
+  caption   String   @default("")
+  imageUrl  String
+  publicId  String   @default("")
+  href      String   @default("/services")
+  order     Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active, order])
+}

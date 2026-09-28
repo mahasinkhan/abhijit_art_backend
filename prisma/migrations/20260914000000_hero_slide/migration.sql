@@ -20,4 +20,5 @@ CREATE TABLE "HeroSlide" (
 CREATE INDEX "HeroSlide_active_order_idx" ON "HeroSlide"("active", "order");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "User_username_key" ON "User"("username");
+ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "username" TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS "User_username_key" ON "User"("username");
