@@ -575,9 +575,10 @@ model QuickOrderPayment {
 /// to that number groups under the same record no matter how the name was
 /// typed. An employee's Payee row links back to their User account.
 model Payee {
-  id     String    @id @default(cuid())
-  name   String
-  phone  String    @unique
+  id      String    @id @default(cuid())
+  name    String
+  nameKey String    @unique
+  phone   String?   @unique
   kind   PayeeKind @default(outsider)
 
   /// set only for staff — links the payee to their login account
