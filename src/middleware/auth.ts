@@ -2,7 +2,7 @@
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import type { Request, Response, NextFunction } from "express";
 import { prisma } from "../config/prisma.js";
-import type { User } from "@prisma/client";
+import type { User, Role } from "@prisma/client";
 
 type SafeUser = Omit<User, "password">;
 
@@ -44,3 +44,28 @@ export const adminOnly = (req: Request, res: Response, next: NextFunction) => {
   }
   next();
 };
+
+/**
+ * Generic gate. Use it when a route suits more than one role.
+ * Always mount it AFTER protect, since it reads req.user.
+ *   router.use(protect, allowRoles("admin", "employee"));
+ */
+export const allowRoles =
+  (...roles: Role[]) =>
+  (req: Request, res: Response, next: NextFunction) => {
+    const role = req.user?.role;
+    if (!role || !roles.includes(role)) {
+      return res.status(403).json({ message: "You do not have access to this" });
+    }
+    next();
+  };
+
+/**
+ * Site content gate: the operations employee who designs and uploads
+ * hero banners, the offer strip and service cards. Admin passes too,
+ * so the owner is never locked out of their own site content.
+ */
+export const operationOnly = allowRoles("admin", "operation");
+
+/** Any signed-in staff member, for shared internal reads. */
+export const staffOnly = allowRoles("admin", "operation", "employee");

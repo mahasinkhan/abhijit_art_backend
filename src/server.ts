@@ -32,6 +32,11 @@ import quickOrderRoutes from "./routes/quickOrderRoutes.js";
 import incomeExpenseRoutes from "./routes/incomeExpenseRoutes.js";
 import payeeRoutes from "./routes/payeeRoutes.js";
 import heroRoutes from "./routes/heroRoutes.js";
+import promoRoutes from "./routes/promoRoutes.js";
+import serviceCardRoutes from "./routes/serviceCardRoutes.js";
+import businessRoutes from "./routes/businessRoutes.js";
+import bulkRoutes from "./routes/bulkRoutes.js";
+import categoryRoutes from "./routes/categoryRoutes.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -122,6 +127,15 @@ app.use("/api/quick-orders",  quickOrderRoutes);
 // Day-to-day cash book (money in and out) + the people it involves
 app.use("/api/payees",         payeeRoutes);
 app.use("/api/income-expense", incomeExpenseRoutes);
+// Public site content, written by the operation role: home banners, the offer
+// bar and the print grid. Each exposes an open GET for the storefront; every
+// write is token gated.
+app.use("/api/hero",          heroRoutes);
+app.use("/api/promo",         promoRoutes);
+app.use("/api/cards",         serviceCardRoutes);
+app.use("/api/business",      businessRoutes);
+app.use("/api/bulk",          bulkRoutes);
+app.use("/api/categories",    categoryRoutes);
 
 // ── Error handling (must come AFTER every route) ─────────────────────────────
 // Any request that matched no route above falls through to notFound; anything
@@ -129,8 +143,6 @@ app.use("/api/income-expense", incomeExpenseRoutes);
 // is the single place that shapes an error into a JSON response. errorHandler
 // MUST be the last app.use — Express identifies it as an error handler by its
 // 4-argument signature.
-app.use("/api/hero", heroRoutes);
-
 app.use(notFound);
 app.use(errorHandler);
 

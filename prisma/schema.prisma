@@ -8,10 +8,14 @@ datasource db {
   directUrl = env("DIRECT_URL")
 }
 
+/// operation = the operations employee who designs and uploads the public
+/// site content: hero banners, the offer strip, service cards. Site content
+/// only, no billing, inventory or customer money.
 enum Role {
   client
   admin
   employee
+  operation
 }
 
 enum BookingStatus {
@@ -142,6 +146,12 @@ model User {
   customerPayments CustomerPayment[]  @relation("CustomerPaymentCreated")
   payeeProfile     Payee?             @relation("PayeeUser")
   expensesCreated  Expense[]          @relation("ExpenseCreatedBy")
+  heroSlides       HeroSlide[]        @relation("HeroSlideCreated")
+  promoStrips      PromoStrip[]       @relation("PromoStripCreated")
+  serviceCards     ServiceCard[]      @relation("ServiceCardCreated")
+  businessBundles  BusinessBundle[]   @relation("BusinessBundleCreated")
+  bulkItems        BulkItem[]         @relation("BulkItemCreated")
+  printCategories  PrintCategory[]    @relation("PrintCategoryCreated")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   address String?
@@ -612,7 +622,7 @@ model Expense {
   title    String
   amount   Decimal     @db.Decimal(12, 2)
   method   PaymentMethod @default(cash)
-  phone       String?    
+  phone       String?
 
 
   /// optional — a shop sale has no person attached, a loan always does
@@ -634,6 +644,8 @@ model Expense {
   @@index([method])
 }
 
+/// Home page banner card. Uploaded and written by the operation role.
+/// Two slides show side by side; further slides rotate as pairs.
 model HeroSlide {
   id          String   @id @default(cuid())
   imageUrl    String
@@ -643,14 +655,141 @@ model HeroSlide {
   titleTop    String   @default("")
   titleBottom String   @default("")
   subtitle    String   @default("")
+  /// button label and target, blank label hides the button
+  ctaText     String   @default("")
+  ctaHref     String   @default("/services")
   order       Int      @default(0)
   active      Boolean  @default(true)
+  /// optional run window, both null means always on
+  startsAt    DateTime?
+  endsAt      DateTime?
+  createdBy   User?    @relation("HeroSlideCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   @@index([active, order])
+  @@index([startsAt, endsAt])
 }
 
+/// The orange offer bar above the banner cards. Same owner as HeroSlide.
+/// Only the highest ordered active row inside its run window is shown.
+model PromoStrip {
+  id        String   @id @default(cuid())
+  text      String
+  href      String   @default("/services")
+  /// gradient ends, hex with the hash, blank falls back to the brand terracotta
+  colorFrom String   @default("")
+  colorTo   String   @default("")
+  order     Int      @default(0)
+  active    Boolean  @default(true)
+  startsAt  DateTime?
+  endsAt    DateTime?
+  createdBy   User?  @relation("PromoStripCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active, order])
+  @@index([startsAt, endsAt])
+}
+
+/// One entry in the icon rail under the header, and the page behind it at
+/// /category/<slug>. The icon itself is drawn in the frontend and matched
+/// by slug, everything else here is editable by the operation role.
+/// Print grid tiles and bulk rates join a category through their own
+/// `category` field, which holds this slug.
+model PrintCategory {
+  id        String   @id @default(cuid())
+  /// rail label, two short lines read best, e.g. "Flex & Banners"
+  title     String
+  slug      String   @unique
+  /// which drawn icon to show in the rail, a key from the frontend icon
+  /// registry such as banner, tshirt, mug. Blank picks one from the title.
+  icon      String   @default("")
+  /// an uploaded icon, used when none of the drawn ones fit. A square PNG
+  /// with a transparent background. When set it wins over `icon`.
+  iconUrl      String @default("")
+  iconPublicId String @default("")
+  /// one or two sentences at the top of the category page
+  blurb     String   @default("")
+  /// optional wide photo for the top of the page
+  imageUrl  String   @default("")
+  publicId  String   @default("")
+  /// what the page sells, shown as a short list of bullet lines
+  points    String   @default("")
+  order     Int      @default(0)
+  active    Boolean  @default(true)
+  createdBy   User?  @relation("PrintCategoryCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active, order])
+  @@index([slug])
+}
+
+/// A bulk rate card: "Bulk Visiting Cards, Rs 2 each for 500 pieces".
+/// Shown as a grid on the home page and in full at /bulk-printing.
+/// Uploaded by the operation role, photo on a plain light background.
+model BulkItem {
+  id         String   @id @default(cuid())
+  name       String
+  imageUrl   String
+  publicId   String   @default("")
+  /// rupees per piece at this quantity
+  pricePer   Int      @default(0)
+  /// the quantity that price applies to
+  minQty     Int      @default(100)
+  /// what one unit is called, e.g. pieces, sheets, sqft
+  unit       String   @default("pieces")
+  /// optional one-liner under the name, shown when pricePer is 0
+  note       String   @default("")
+  /// PrintCategory slug this belongs to, blank means it only shows in the
+  /// full bulk list and not on any category page
+  category   String   @default("")
+  href       String   @default("/services")
+  order      Int      @default(0)
+  active     Boolean  @default(true)
+  createdBy   User?   @relation("BulkItemCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([active, order])
+}
+
+/// "Shop by business needs" bundle: one tall card per industry, shown as a
+/// carousel on the home page and as a full grid at /shop-by-business.
+/// The operation role uploads a plain photo; the title, the line of items
+/// and the Explore button are drawn over it by the frontend, so the text
+/// stays editable and crisp instead of being baked into the image.
+model BusinessBundle {
+  id        String   @id @default(cuid())
+  /// headline on the card, e.g. "Cafe & Restaurant"
+  title     String
+  /// the small line under it, e.g. "Menus, labels, tents"
+  items     String   @default("")
+  imageUrl  String
+  publicId  String   @default("")
+  /// url slug, used as /shop-by-business/<slug> when a detail page exists
+  slug      String   @unique
+  /// where the Explore button goes; blank falls back to the slug route
+  href      String   @default("")
+  ctaText   String   @default("Explore")
+  order     Int      @default(0)
+  active    Boolean  @default(true)
+  createdBy   User?  @relation("BusinessBundleCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([active, order])
+  @@index([slug])
+}
+
+/// A product tile in the "what we print" grid under the hero. Photo, name,
+/// a from-price and an optional badge. Uploaded by the operation role.
 model ServiceCard {
   id        String   @id @default(cuid())
   name      String
@@ -658,8 +797,16 @@ model ServiceCard {
   imageUrl  String
   publicId  String   @default("")
   href      String   @default("/services")
+  /// rupees, shown as "Starts from Rs X". 0 hides the price line.
+  priceFrom Int      @default(0)
+  /// short corner tag such as "Same day" or "Bestseller", blank hides it
+  badge     String   @default("")
+  /// PrintCategory slug this tile belongs to, blank means home grid only
+  category  String   @default("")
   order     Int      @default(0)
   active    Boolean  @default(true)
+  createdBy   User?  @relation("ServiceCardCreated", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
