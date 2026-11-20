@@ -37,6 +37,7 @@ import serviceCardRoutes from "./routes/serviceCardRoutes.js";
 import businessRoutes from "./routes/businessRoutes.js";
 import bulkRoutes from "./routes/bulkRoutes.js";
 import categoryRoutes from "./routes/categoryRoutes.js";
+import reviewRoutes from "./routes/reviewRoutes.js";
 import { notFound, errorHandler } from "./middleware/error.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -136,6 +137,10 @@ app.use("/api/cards",         serviceCardRoutes);
 app.use("/api/business",      businessRoutes);
 app.use("/api/bulk",          bulkRoutes);
 app.use("/api/categories",    categoryRoutes);
+// Public testimonials. GET and POST are open so any visitor can read the
+// approved reviews and submit one; a submission lands as `pending` and the
+// moderation endpoints below it in the router need an admin login.
+app.use("/api/reviews",       reviewRoutes);
 
 // ── Error handling (must come AFTER every route) ─────────────────────────────
 // Any request that matched no route above falls through to notFound; anything

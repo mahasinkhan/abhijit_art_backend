@@ -90,6 +90,16 @@ enum TaskPriority {
   urgent
 }
 
+/// A review written by a visitor on the public site. Nothing a visitor
+/// writes goes live on its own: a new row is `pending` until an admin
+/// approves it, which keeps spam and competitor abuse off the home page
+/// and out of Google's index.
+enum ReviewStatus {
+  pending
+  approved
+  rejected
+}
+
 /// Covers both directions — the UI shows only the ones that fit the kind.
 enum TxnCategory {
   // money out
@@ -152,6 +162,7 @@ model User {
   businessBundles  BusinessBundle[]   @relation("BusinessBundleCreated")
   bulkItems        BulkItem[]         @relation("BulkItemCreated")
   printCategories  PrintCategory[]    @relation("PrintCategoryCreated")
+  reviewsApproved  Review[]           @relation("ReviewApproved")
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   address String?
@@ -219,6 +230,43 @@ model Lead {
   page      String   @default("")
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+/// A public testimonial. Anyone on the site can submit one; it shows on the
+/// home page only once an admin sets status to `approved`.
+/// `email` and `phone` are for contacting the reviewer and are NEVER
+/// returned by the public endpoint — only name, role, rating, text and date.
+/// `rating` drives the aggregate shown to visitors and the JSON-LD
+/// AggregateRating that Google reads, so it is required, 1 to 5.
+model Review {
+  id     String @id @default(cuid())
+  name   String
+  /// "Owner, Sharma Traders" — business or role, optional
+  role   String @default("")
+  rating Int    @default(5)
+  text   String
+
+  /// contact details, internal only, never sent to the public site
+  email String @default("")
+  phone String @default("")
+
+  status     ReviewStatus @default(pending)
+  /// pins a review to the front of the list
+  featured   Boolean      @default(false)
+  approvedAt DateTime?
+  approvedBy   User?   @relation("ReviewApproved", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedById String?
+
+  /// kept for tracing spam bursts, not shown anywhere in the UI
+  ip        String @default("")
+  userAgent String @default("")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@index([status, featured])
+  @@index([rating])
 }
 
 model Supplier {
